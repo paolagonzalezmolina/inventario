@@ -1,8 +1,13 @@
 """
-app.py — Inventario AWS (1 cuenta)
+app.py — Inventario AWS (CON CACHÉ LOCAL)
 ======================================================
-Secciones: Infraestructura · Lambda · Redes · EC2 · BBDD · Multi-cuenta
+Secciones: Dashboard · Infraestructura · Lambda · Redes · EC2 · BBDD · Multi-cuenta
 Corre con:  streamlit run app.py
+
+NUEVAS CARACTERÍSTICAS:
+- Caché local persistente en ~/.cache/aws_inventory/
+- Detección automática de cambios
+- Dashboard con estado del caché y alertas
 """
 
 import streamlit as st
@@ -11,6 +16,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
 import json
+from cache_manager import cache_manager
 
 # ─── Fuente de datos ──────────────────────────────────────────────────────────
 MODO_DEMO = False   # ← Cambiar a True si no tienes credenciales AWS
@@ -21,40 +27,8 @@ if MODO_DEMO:
         get_vpc_df, get_alertas,
         get_relaciones, get_resumen
     )
-    # Funciones stub para modo demo
-    def get_identity():
-        return {"account_id": "123456789012", "account_name": "DEMO-ACCOUNT",
-                "arn": "arn:aws:iam::123456789012:user/demo",
-                "user_id": "DEMO", "region": "us-east-1"}
-    def get_aurora_df():
-        return pd.DataFrame(columns=["id","nombre","motor","version","estado","tipo","tipo_bd","region","az","vpc","multi_az","almacenamiento_gb","miembros","endpoint","ultima_actualizacion"])
-    def get_dynamodb_df():
-        return pd.DataFrame(columns=["id","nombre","motor","version","estado","tipo","tipo_bd","region","items","tamaño_bytes","rcu","wcu","gsi_count","ultima_actualizacion"])
-    def get_subnets_df():
-        return pd.DataFrame(columns=["id","nombre","vpc_id","cidr","az","ips_disponibles","publica","estado"])
-    def get_azs_df():
-        return pd.DataFrame(columns=["nombre","zone_id","tipo","estado","region","grupo"])
-    def get_s3_df():
-        return pd.DataFrame(columns=["nombre","region","creado"])
-    def get_api_df():
-        return pd.DataFrame(columns=["id","nombre","tipo","estado","region","endpoint","version"])
-    def get_iam_users_df():
-        return pd.DataFrame(columns=["nombre","tipo","estado","mfa","politicas","n_politicas","ultimo_acceso","pwd_rotacion","access_keys","arn"])
-    def get_resumen_perfil(perfil):
-        return {"perfil":perfil,"region":"us-east-1","ec2_total":0,"ec2_running":0,"rds_total":0,"aurora_total":0,"bd_total":0,"lambda_total":0,"s3_total":0,"dynamo_total":0,"vpc_total":0,"subnet_total":0}
-    def get_identity_perfil(perfil):
-        return {"account_id":"—","account_name":perfil,"arn":"—","region":"us-east-1","perfil":perfil}
-    def get_ec2_perfil(perfil):      return pd.DataFrame()
-    def get_rds_perfil(perfil):      return pd.DataFrame()
-    def get_lambda_perfil(perfil):   return pd.DataFrame()
-    def get_vpc_perfil(perfil):      return pd.DataFrame()
-    def get_s3_perfil(perfil):       return pd.DataFrame()
-    def get_dynamodb_perfil(perfil): return pd.DataFrame()
-    def get_iam_users_perfil(perfil): return pd.DataFrame()
-    def get_comparacion_regiones(perfil): return []
-    def _regiones(perfil): return ["us-east-1"]
-    def _df_region(perfil, region, tipo): return pd.DataFrame()
-    def get_resumen_region(perfil, region): return {}
+    def get_cache_status():
+        return {'metadata': {}, 'stats': {'total_files': 0, 'total_size_mb': 0, 'cache_dir': 'demo'}}
 else:
     try:
         from conector_aws import (
@@ -68,6 +42,7 @@ else:
             get_ec2_perfil, get_rds_perfil, get_lambda_perfil,
             get_vpc_perfil, get_s3_perfil, get_dynamodb_perfil,
             get_comparacion_regiones, _regiones, _df_region, get_resumen_region,
+            get_cache_status, comparar_lambdas_produccion, get_api_lambda_mapping,
         )
     except Exception as _e:
         st.error(f"❌ Error conectando a AWS: {_e}")
@@ -96,23 +71,29 @@ st.markdown("""
     .alerta-critica { background: #1f0f0f; border-left: 3px solid #e05252; border-radius: 4px; padding: 12px 16px; margin-bottom: 8px; font-size: 0.88rem; }
     .alerta-aviso   { background: #1a1505; border-left: 3px solid #d4a017; border-radius: 4px; padding: 12px 16px; margin-bottom: 8px; font-size: 0.88rem; }
     .alerta-info    { background: #0a1520; border-left: 3px solid #3a7bd5; border-radius: 4px; padding: 12px 16px; margin-bottom: 8px; font-size: 0.88rem; }
+    .alerta-cambio  { background: #0a1a0f; border-left: 3px solid #5ecf8e; border-radius: 4px; padding: 12px 16px; margin-bottom: 8px; font-size: 0.88rem; }
     .demo-badge { display:inline-block; background:#1a1505; color:#d4a017; border:1px solid #d4a017; padding:2px 10px; border-radius:4px; font-size:0.72rem; font-family:'IBM Plex Mono',monospace; margin-left:12px; vertical-align:middle; }
     .seccion-titulo { font-size:0.75rem; text-transform:uppercase; letter-spacing:0.12em; color:#5a5e72; margin:24px 0 12px; font-weight:500; }
     .header-titulo { font-size:1.6rem; font-weight:500; color:#e8eaf0; margin:0; }
     .header-sub    { font-size:0.82rem; color:#5a5e72; font-family:'IBM Plex Mono',monospace; margin-top:2px; }
     .ctx-box { background:#0d1117; border:1px solid #1e2330; border-radius:6px; padding:10px 14px; margin-bottom:16px; font-family:'IBM Plex Mono',monospace; font-size:0.78rem; color:#8b8fa8; }
     .ctx-box strong { color:#c8ccd4; }
-    .policy-box { background:#0a1520; border:1px solid #1a3050; border-radius:8px; padding:16px; margin:12px 0; }
-    .inv-group { background:#111520; border:1px solid #1e2538; border-radius:8px; padding:14px 18px; margin-bottom:10px; }
-    .inv-group-title { font-size:0.8rem; font-weight:500; color:#7fb8f0; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:8px; display:flex; align-items:center; gap:8px; }
-    .inv-group-count { font-family:'IBM Plex Mono',monospace; font-size:1.3rem; color:#e8eaf0; font-weight:500; }
+    .cache-box { background:#0d1520; border:1px solid #1a3050; border-radius:6px; padding:14px; margin-bottom:12px; font-family:'IBM Plex Mono',monospace; font-size:0.75rem; }
+    .cache-box-item { margin-bottom: 8px; color: #8b8fa8; }
+    .cache-box-item strong { color: #7fb8f0; }
+    .cache-fresh { color: #5ecf8e; }
+    .cache-stale { color: #d4a017; }
+    .cache-error { color: #e05252; }
 </style>
 """, unsafe_allow_html=True)
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 OPCIONES_MENU = [
-    "📊 Infraestructura AWS",
+    "📊 Dashboard",
+    "📈 Infraestructura AWS",
     "🪣 S3 — Buckets",
+    "⚡ Lambda",
+    "🔌 API Gateway",
     "👥 Usuarios IAM",
     "🗺️ Multi-región",
     "🌍 Multi-cuenta",
@@ -128,17 +109,47 @@ with st.sidebar:
     st.markdown("---")
     seccion = st.radio("Sección", OPCIONES_MENU, label_visibility="collapsed", key="menu_radio")
     st.markdown("---")
+    
+    # Botones de control del caché
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🔄 Refresh", use_container_width=True, help="Fuerza actualización de datos"):
+            st.cache_data.clear()
+            st.rerun()
+    with col2:
+        if st.button("🗑️ Limpiar caché", use_container_width=True, help="Limpia caché local"):
+            cache_manager.clear()
+            st.success("Caché limpiado")
+    
+    st.markdown("---")
     st.markdown("<small style='color:#3a3e52'>Última actualización</small>", unsafe_allow_html=True)
     st.markdown(f"<small style='font-family:IBM Plex Mono;color:#5a5e72'>{datetime.now().strftime('%Y-%m-%d %H:%M')}</small>", unsafe_allow_html=True)
     if MODO_DEMO:
         st.markdown("<br><small style='color:#d4a017'>⚠ Modo demo — datos de ejemplo</small>", unsafe_allow_html=True)
 
-# ─── Cargar datos base (solo identidad — el resto se carga por sección) ───
-identity = get_identity()
+# ─── Cargar identidad (si no es demo) ───
+if not MODO_DEMO:
+    identity = get_identity()
+else:
+    identity = {
+        "account_id": "DEMO-123456789012",
+        "account_name": "DEMO-ACCOUNT",
+        "arn": "arn:aws:iam::123456789012:user/demo",
+        "region": "us-east-1"
+    }
 
-# ─── Helper: Context Bar ─────────────────────────────────────────────────────
+# ─── Opciones estáticas (sin llamadas a AWS) ─────────────────────────────────────
+OPCIONES_CUENTA_REGION_STATIC = [
+    ("afex-des",     "us-east-1", "afex-des - us-east-1 Virginia"),
+    ("afex-prod",    "us-east-1", "afex-prod - us-east-1 Virginia"),
+    ("afex-prod",    "us-east-2", "afex-prod - us-east-2 Ohio"),
+    ("afex-peru",    "us-east-1", "afex-peru - us-east-1 Virginia"),
+    ("afex-digital", "us-east-1", "afex-digital - us-east-1 Virginia"),
+]
+
+# ─── Helper: Context Bar ─────────────────────────────────────────────────────────
 def mostrar_contexto():
-    """Muestra barra de contexto con cuenta, nombre, región y usuario."""
+    """Muestra barra de contexto con cuenta, región y usuario."""
     nombre_cuenta = identity.get('account_name', '')
     label_cuenta = f"{nombre_cuenta} ({identity['account_id']})" if nombre_cuenta else identity['account_id']
     st.markdown(f"""
@@ -149,328 +160,1020 @@ def mostrar_contexto():
     </div>
     """, unsafe_allow_html=True)
 
+def mostrar_cache_status():
+    """Muestra estado del caché local."""
+    status = get_cache_status()
+    stats = status['stats']
+    metadata = status['metadata']
+    
+    st.markdown('<p class="seccion-titulo">📁 Estado del caché local</p>', unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Archivos en caché", f"{stats['total_files']}")
+    with col2:
+        st.metric("Tamaño total", f"{stats['total_size_mb']} MB")
+    with col3:
+        st.metric("Ubicación", "~/.cache/aws_inventory")
+    
+    # Detalles por servicio
+    if metadata:
+        st.markdown('<p class="seccion-titulo">Detalles por servicio</p>', unsafe_allow_html=True)
+        
+        for key, info in metadata.items():
+            ts = info.get('timestamp', '—')
+            size = info.get('size_bytes', 0)
+            
+            # Determinar si está fresco
+            from datetime import datetime, timedelta
+            try:
+                last_update = datetime.fromisoformat(ts)
+                is_fresh = (datetime.now() - last_update) < timedelta(days=1)
+                status_class = "cache-fresh" if is_fresh else "cache-stale"
+                status_text = "✅ Fresco" if is_fresh else "⏱️ Antiguo"
+            except:
+                status_class = "cache-error"
+                status_text = "❌ Error"
+            
+            st.markdown(f"""
+            <div class="cache-box">
+                <div class="cache-box-item"><strong>{key}:</strong> <span class="{status_class}">{status_text}</span></div>
+                <div class="cache-box-item">Actualizado: {ts.split('T')[0] if 'T' in ts else ts}</div>
+                <div class="cache-box-item">Tamaño: {round(size/1024, 1)} KB</div>
+            </div>
+            """, unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 1 — INFRAESTRUCTURA AWS (inventario agrupado por tipo)
+# SECCIÓN 0 — DASHBOARD
 # ═══════════════════════════════════════════════════════════════════════════════
-# ─── Helpers multi-cuenta ────────────────────────────────────────────────────
-# Opciones de cuenta/región — agregar más aquí cuando se sumen cuentas
-OPCIONES_CUENTA_REGION = [
-    ("afex-des",     "us-east-1"),
-    ("afex-prod",    "us-east-1"),
-    ("afex-prod",    "us-east-2"),
-    ("afex-peru",    "us-east-1"),
-    ("afex-digital", "us-east-1"),
-]
 
-REGIONES_NOMBRES_APP = {
-    "us-east-1": "us-east-1 Virginia",
-    "us-east-2": "us-east-2 Ohio",
-    "us-west-1": "us-west-1 California",
-    "us-west-2": "us-west-2 Oregon",
-    "sa-east-1": "sa-east-1 São Paulo",
-}
+if seccion == "📊 Dashboard":
+    st.markdown('<p class="header-titulo">Dashboard</p>', unsafe_allow_html=True)
+    st.markdown('<p class="header-sub">Estado general del inventario y cambios detectados</p>', unsafe_allow_html=True)
+    st.markdown("")
+    
+    # Selector de vista
+    col_vista1, col_vista2 = st.columns([3, 1])
+    with col_vista1:
+        vista_seleccionada = st.radio(
+            "Vista:",
+            ["🌍 Todas las cuentas", "📌 Cuenta actual"],
+            horizontal=True,
+            label_visibility="collapsed"
+        )
+    
+    st.markdown("")
+    
+    # ─── VISTA 1: TODAS LAS CUENTAS ───
+    if vista_seleccionada == "🌍 Todas las cuentas":
+        st.markdown('<p class="seccion-titulo">Resumen global - 4 cuentas AWS</p>', unsafe_allow_html=True)
+        
+        try:
+            # Listas de perfiles
+            PERFILES_MULTI = ["afex-des", "afex-prod", "afex-peru", "afex-digital"]
+            
+            # Agregadores
+            total_ec2 = 0
+            total_ec2_running = 0
+            total_rds = 0
+            total_lambda = 0
+            total_vpc = 0
+            total_s3 = 0
+            
+            cuentas_info = []
+            
+            # SOLO caché local - SIN AWS (instantáneo)
+            datos_encontrados = 0
+            for perfil in PERFILES_MULTI:
+                try:
+                    cache_key = f"resumen_{perfil}"
+                    cached_data, is_fresh, _ = cache_manager.get(cache_key)
+                    
+                    if cached_data:  # Si hay algo en caché, usarlo
+                        res = cached_data
+                        datos_encontrados += 1
+                    else:
+                        continue  # Sin caché = saltarlo, no llamar a AWS
+                    
+                    ec2_t = res.get("ec2_total", 0)
+                    ec2_r = res.get("ec2_running", 0)
+                    rds_t = res.get("rds_total", 0)
+                    lam_t = res.get("lambda_total", 0)
+                    vpc_t = res.get("vpc_total", 0)
+                    s3_t = res.get("s3_total", 0)
+                    
+                    total_ec2 += ec2_t
+                    total_ec2_running += ec2_r
+                    total_rds += rds_t
+                    total_lambda += lam_t
+                    total_vpc += vpc_t
+                    total_s3 += s3_t
+                    
+                    cuentas_info.append({
+                        "cuenta": perfil,
+                        "ec2": ec2_t,
+                        "rds": rds_t,
+                        "lambda": lam_t,
+                        "vpc": vpc_t,
+                        "s3": s3_t
+                    })
+                except:
+                    pass
+            
+            # Si no hay datos en caché, mostrar aviso
+            if datos_encontrados == 0:
+                st.info("📦 No hay datos cacheados. Haz click en 🔄 **Refresh** (en la barra lateral) para cargar desde AWS (esto puede tomar ~60s)")
+            else:
+                # Mostrar resumen agregado en grande
+                st.markdown('<p class="seccion-titulo">📊 Totales agregados</p>', unsafe_allow_html=True)
+                col1, col2, col3, col4, col5, col6 = st.columns(6)
+                
+                with col1:
+                    st.metric("EC2 Total", total_ec2, delta=f"{total_ec2_running} en ejecución")
+                with col2:
+                    st.metric("BD RDS", total_rds)
+                with col3:
+                    st.metric("Lambda", total_lambda)
+                with col4:
+                    st.metric("VPCs", total_vpc)
+                with col5:
+                    st.metric("S3", total_s3)
+                with col6:
+                    st.metric("Cuentas", len(cuentas_info))
+                
+                st.markdown("")
+                
+                # Tabla de detalles por cuenta
+                st.markdown('<p class="seccion-titulo">Desglose por cuenta</p>', unsafe_allow_html=True)
+                
+                df_cuentas = pd.DataFrame(cuentas_info)
+                if not df_cuentas.empty:
+                    st.dataframe(
+                        df_cuentas.rename(columns={
+                            "cuenta": "Cuenta",
+                            "ec2": "EC2",
+                            "rds": "RDS",
+                            "lambda": "Lambda",
+                            "vpc": "VPCs",
+                            "s3": "S3"
+                        }),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                
+                st.markdown("")
+                
+                # Gráfico comparativo
+                st.markdown('<p class="seccion-titulo">Comparación entre cuentas</p>', unsafe_allow_html=True)
+                
+                if not df_cuentas.empty:
+                    df_graf = df_cuentas.set_index("cuenta")[["ec2", "rds", "lambda", "vpc"]].reset_index()
+                    df_melt = df_graf.melt(id_vars="cuenta", var_name="Servicio", value_name="Cantidad")
+                    
+                    fig = px.bar(
+                        df_melt,
+                        x="cuenta",
+                        y="Cantidad",
+                        color="Servicio",
+                        barmode="group",
+                        color_discrete_sequence=["#7fb8f0", "#a09ee0", "#d4a017", "#3ecf8e"],
+                        labels={"cuenta": "Cuenta", "Cantidad": "Recursos"}
+                    )
+                    
+                    fig.update_layout(
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        font_color="#c8ccd4",
+                        height=350,
+                        xaxis=dict(gridcolor="#1a1d27"),
+                        yaxis=dict(gridcolor="#1a1d27"),
+                        margin=dict(l=0, r=0, t=10, b=0),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+        
+        except Exception as e:
+            st.error(f"Error cargando datos: {e}")
+        
+        # Alertas para "Todas las cuentas"
+        st.markdown("")
+        st.markdown('<p class="seccion-titulo">🚨 Alertas activas</p>', unsafe_allow_html=True)
+        
+        try:
+            alertas = get_alertas()
+            
+            if not alertas:
+                st.success("✅ Sin alertas críticas")
+            else:
+                alertas_criticas = [a for a in alertas if a.get("severidad") == "CRÍTICA"]
+                alertas_aviso = [a for a in alertas if a.get("severidad") == "AVISO"]
+                alertas_info = [a for a in alertas if a.get("severidad") == "INFO"]
+                
+                if alertas_criticas:
+                    st.markdown("<h4>🔴 Críticas</h4>", unsafe_allow_html=True)
+                    for alerta in alertas_criticas:
+                        st.markdown(f"""
+                        <div class="alerta-critica">
+                            <strong>{alerta['componente']}</strong> — {alerta['mensaje']}<br>
+                            <span style="color:#5a5e72;font-size:0.8rem">{alerta['tiempo']}</span>
+                        </div>""", unsafe_allow_html=True)
+                
+                if alertas_aviso:
+                    st.markdown("<h4>🟡 Avisos</h4>", unsafe_allow_html=True)
+                    for alerta in alertas_aviso:
+                        st.markdown(f"""
+                        <div class="alerta-aviso">
+                            <strong>{alerta['componente']}</strong> — {alerta['mensaje']}<br>
+                            <span style="color:#5a5e72;font-size:0.8rem">{alerta['tiempo']}</span>
+                        </div>""", unsafe_allow_html=True)
+                
+                if alertas_info:
+                    st.markdown("<h4>ℹ️ Información</h4>", unsafe_allow_html=True)
+                    for alerta in alertas_info:
+                        st.markdown(f"""
+                        <div class="alerta-info">
+                            <strong>{alerta['componente']}</strong> — {alerta['mensaje']}<br>
+                            <span style="color:#5a5e72;font-size:0.8rem">{alerta['tiempo']}</span>
+                        </div>""", unsafe_allow_html=True)
+        except Exception as e:
+            st.warning(f"Error cargando alertas: {e}")
+    
+    # ─── VISTA 2: CUENTA ACTUAL ───
+    else:
+        # Selectbox ESTÁTICO - sin llamadas a AWS (instantáneo)
+        opciones_dict = {label: (perfil, region) for perfil, region, label in OPCIONES_CUENTA_REGION_STATIC}
+        sel = st.selectbox("Selecciona Cuenta / Región", list(opciones_dict.keys()), key="cta_dashboard")
+        perfil_activo, region_activa = opciones_dict[sel]
+        
+        st.markdown("")
+        
+        # Contexto del perfil y región (caché esto también)
+        d   = get_identity_perfil(perfil_activo)
+        nom = d.get("account_name", perfil_activo)
+        lbl = f"{nom} ({d['account_id']})" if d.get("account_id","—") != "—" else nom
+        usr = d["arn"].split("/")[-1] if "/" in d.get("arn","") else d.get("arn","—")
+        
+        REGIONES_NOMBRES_APP = {
+            "us-east-1": "us-east-1 Virginia",
+            "us-east-2": "us-east-2 Ohio",
+            "us-west-1": "us-west-1 California",
+            "us-west-2": "us-west-2 Oregon",
+            "sa-east-1": "sa-east-1 São Paulo",
+        }
+        region_nombre = REGIONES_NOMBRES_APP.get(region_activa, region_activa)
+        st.markdown(f'''<div class="ctx-box"><strong>Cuenta:</strong> {lbl} &nbsp;·&nbsp;
+            <strong>Región:</strong> {region_nombre} &nbsp;·&nbsp;
+            <strong>Usuario:</strong> {usr}</div>''', unsafe_allow_html=True)
+        
+        st.markdown("")
+        
+        st.markdown('<p class="seccion-titulo">📊 Resumen de infraestructura</p>', unsafe_allow_html=True)
+        
+        try:
+            # Estrategia: Intentar caché local PRIMERO (sin AWS)
+            cache_key = f"resumen_region_{perfil_activo}_{region_activa}"
+            cached_data, is_fresh, _ = cache_manager.get(cache_key)
+            
+            if cached_data:
+                # Usar caché local si existe
+                resumen = cached_data
+            else:
+                # Si no hay caché, cargar de AWS
+                resumen = get_resumen_region(perfil_activo, region_activa)
+                # Guardar en caché local
+                cache_manager.set(cache_key, resumen)
+            
+            col1, col2, col3, col4, col5 = st.columns(5)
+            
+            with col1:
+                st.metric("Instancias EC2", resumen.get("ec2_total", 0))
+            with col2:
+                st.metric("En ejecución", resumen.get("ec2_running", 0))
+            with col3:
+                st.metric("BD RDS", resumen.get("rds_total", 0))
+            with col4:
+                st.metric("Funciones Lambda", resumen.get("lambda_total", 0))
+            with col5:
+                st.metric("VPCs", resumen.get("vpc_total", 0))
+        except Exception as e:
+            st.error(f"Error cargando resumen: {e}")
+        
+        # Alertas para "Cuenta actual"
+        st.markdown("")
+        st.markdown('<p class="seccion-titulo">🚨 Alertas activas</p>', unsafe_allow_html=True)
+        
+        try:
+            alertas = get_alertas()
+            
+            if not alertas:
+                st.success("✅ Sin alertas críticas")
+            else:
+                alertas_criticas = [a for a in alertas if a.get("severidad") == "CRÍTICA"]
+                alertas_aviso = [a for a in alertas if a.get("severidad") == "AVISO"]
+                alertas_info = [a for a in alertas if a.get("severidad") == "INFO"]
+                
+                if alertas_criticas:
+                    st.markdown("<h4>🔴 Críticas</h4>", unsafe_allow_html=True)
+                    for alerta in alertas_criticas:
+                        st.markdown(f"""
+                        <div class="alerta-critica">
+                            <strong>{alerta['componente']}</strong> — {alerta['mensaje']}<br>
+                            <span style="color:#5a5e72;font-size:0.8rem">{alerta['tiempo']}</span>
+                        </div>""", unsafe_allow_html=True)
+                
+                if alertas_aviso:
+                    st.markdown("<h4>🟡 Avisos</h4>", unsafe_allow_html=True)
+                    for alerta in alertas_aviso:
+                        st.markdown(f"""
+                        <div class="alerta-aviso">
+                            <strong>{alerta['componente']}</strong> — {alerta['mensaje']}<br>
+                            <span style="color:#5a5e72;font-size:0.8rem">{alerta['tiempo']}</span>
+                        </div>""", unsafe_allow_html=True)
+                
+                if alertas_info:
+                    st.markdown("<h4>ℹ️ Información</h4>", unsafe_allow_html=True)
+                    for alerta in alertas_info:
+                        st.markdown(f"""
+                        <div class="alerta-info">
+                            <strong>{alerta['componente']}</strong> — {alerta['mensaje']}<br>
+                            <span style="color:#5a5e72;font-size:0.8rem">{alerta['tiempo']}</span>
+                        </div>""", unsafe_allow_html=True)
+        except Exception as e:
+            st.warning(f"Error cargando alertas: {e}")
+    
+    st.markdown("")
+    
+    # Estado del caché (siempre mostrar)
+    mostrar_cache_status()
+    
+    st.markdown("")
+    st.markdown('<p class="seccion-titulo">💡 Información de caché</p>', unsafe_allow_html=True)
+    
+    info_col1, info_col2 = st.columns(2)
+    
+    with info_col1:
+        st.markdown("""
+        **¿Cómo funciona el caché?**
+        
+        - Los datos se guardan localmente en `~/.cache/aws_inventory/`
+        - Se actualizan automáticamente cada **1 día**
+        - Si detecta cambios, se muestra un indicador verde en el Dashboard
+        - Puedes hacer refresh forzado con el botón 🔄 en el sidebar
+        """)
+    
+    with info_col2:
+        st.markdown("""
+        **Beneficios:**
+        
+        ✅ Carga más rápida (sin esperar a AWS)
+        ✅ Funciona sin conexión a AWS
+        ✅ Detecta cambios automáticamente
+        ✅ Ahorra tiempo y requests a AWS
+        ✅ Historial de cambios
+        """)
 
-@st.cache_data(ttl=300)
-def _nombre_cuenta_region(perfil, region):
-    try:
-        d = get_identity_perfil(perfil)
-        nombre = d.get("account_name", perfil)
-        cuenta = d.get("account_id", "")
-        region_nombre = REGIONES_NOMBRES_APP.get(region, region)
-        return f"{nombre} ({cuenta}) - {region_nombre}"
-    except Exception:
-        return f"{perfil} - {REGIONES_NOMBRES_APP.get(region, region)}"
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECCIÓN 1 — INFRAESTRUCTURA AWS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def selector_cuenta(key="sel"):
-    """Retorna (perfil, region) según selección del usuario."""
-    opciones = {_nombre_cuenta_region(p, r): (p, r) for p, r in OPCIONES_CUENTA_REGION}
-    sel = st.selectbox("Cuenta / Región", list(opciones.keys()), key=f"cta_{key}")
-    return opciones[sel]
-
-def contexto_perfil(perfil):
-    d   = get_identity_perfil(perfil)
-    nom = d.get("account_name", perfil)
+elif seccion == "📈 Infraestructura AWS":
+    st.markdown('<p class="header-titulo">Infraestructura AWS</p>', unsafe_allow_html=True)
+    st.markdown('<p class="header-sub">EC2 · RDS · Lambda · VPC · API Gateway</p>', unsafe_allow_html=True)
+    st.markdown("")
+    
+    # Selector ESTÁTICO (sin llamadas a AWS)
+    opciones_dict = {label: (perfil, region) for perfil, region, label in OPCIONES_CUENTA_REGION_STATIC}
+    sel = st.selectbox("Cuenta / Región", list(opciones_dict.keys()), key="cta_infra")
+    perfil_activo, region_activa = opciones_dict[sel]
+    
+    st.markdown("")
+    
+    # Contexto del perfil y región
+    REGIONES_NOMBRES_APP = {
+        "us-east-1": "us-east-1 Virginia",
+        "us-east-2": "us-east-2 Ohio",
+        "us-west-1": "us-west-1 California",
+        "us-west-2": "us-west-2 Oregon",
+        "sa-east-1": "sa-east-1 São Paulo",
+    }
+    d   = get_identity_perfil(perfil_activo)
+    nom = d.get("account_name", perfil_activo)
     lbl = f"{nom} ({d['account_id']})" if d.get("account_id","—") != "—" else nom
     usr = d["arn"].split("/")[-1] if "/" in d.get("arn","") else d.get("arn","—")
-    st.markdown(f'''<div class="ctx-box"><strong>Cuenta:</strong> {lbl} &nbsp;·&nbsp;
-        <strong>Región:</strong> {d["region"]} &nbsp;·&nbsp;
-        <strong>Usuario:</strong> {usr}</div>''', unsafe_allow_html=True)
-
-def contexto_perfil_region(perfil, region):
-    d   = get_identity_perfil(perfil)
-    nom = d.get("account_name", perfil)
-    lbl = f"{nom} ({d['account_id']})" if d.get("account_id","—") != "—" else nom
-    usr = d["arn"].split("/")[-1] if "/" in d.get("arn","") else d.get("arn","—")
-    region_nombre = REGIONES_NOMBRES_APP.get(region, region)
+    region_nombre = REGIONES_NOMBRES_APP.get(region_activa, region_activa)
     st.markdown(f'''<div class="ctx-box"><strong>Cuenta:</strong> {lbl} &nbsp;·&nbsp;
         <strong>Región:</strong> {region_nombre} &nbsp;·&nbsp;
         <strong>Usuario:</strong> {usr}</div>''', unsafe_allow_html=True)
-
-if seccion == "📊 Infraestructura AWS":
-
-    demo_tag = '<span class="demo-badge">DEMO</span>' if MODO_DEMO else ''
-    st.markdown(f'<p class="header-titulo">Infraestructura AWS {demo_tag}</p>', unsafe_allow_html=True)
-    st.markdown('<p class="header-sub">Inventario completo de componentes en la nube</p>', unsafe_allow_html=True)
-    st.markdown("")
-
-    perfil_activo, region_activa = selector_cuenta("infra")
-    st.markdown("")
-
-    # Cargar datos de la región seleccionada específicamente
-    if perfil_activo == "inventario":
-        resumen_base = get_resumen()
-        df_ec2    = get_ec2_df()
-        df_rds    = get_rds_df()
-        df_aurora = get_aurora_df()
-        df_dynamo = get_dynamodb_df()
-        df_lambda = get_lambda_df()
-        df_vpc    = get_vpc_df()
-        df_subnet = get_subnets_df()
-        df_s3     = get_s3_df()
-        df_api    = get_api_df()
-        regiones_perfil = ["us-east-1"]
-    else:
-        # Cargar datos de la región activa (no todas las regiones combinadas)
-        df_ec2    = _df_region(perfil_activo, region_activa, "ec2")
-        df_rds    = _df_region(perfil_activo, region_activa, "rds")
-        df_lambda = _df_region(perfil_activo, region_activa, "lambda")
-        df_vpc    = _df_region(perfil_activo, region_activa, "vpc")
-        df_dynamo = _df_region(perfil_activo, region_activa, "dynamo")
-        df_aurora = pd.DataFrame()
-        df_subnet = pd.DataFrame()
-        df_s3     = get_s3_perfil(perfil_activo)   # S3 es global, no por región
-        df_api    = pd.DataFrame()
-        resumen_base = get_resumen_region(perfil_activo, region_activa)
-        regiones_perfil = _regiones(perfil_activo)
-
-    # Resumen para los 8 cuadros — datos de la región activa
-    resumen = {
-        "ec2_total":    len(df_ec2),
-        "ec2_running":  len(df_ec2[df_ec2["estado"]=="running"]) if not df_ec2.empty and "estado" in df_ec2.columns else 0,
-        "lambda_total": len(df_lambda),
-        "bd_total":     len(df_rds) + len(df_aurora) + len(df_dynamo),
-        "vpc_total":    len(df_vpc),
-        "subnet_total": len(df_subnet),
-        "aurora_total": len(df_aurora),
-        "dynamo_total": len(df_dynamo),
-        "s3_total":     len(df_s3),
-        "rds_total":    len(df_rds),
-    }
-
-    # ── Tarjetas resumen — 8 cuadros ─────────────────────────────────────────
-    tarjetas = [
-        ("#0c1f3a", "#185FA5", "#378ADD", "EC2",      str(resumen.get('ec2_total', len(df_ec2)))),
-        ("#2a1a05", "#854F0B", "#d4a017", "LAMBDA",   str(resumen.get('lambda_total', len(df_lambda)))),
-        ("#0a2a1f", "#0F6E56", "#3ecf8e", "BBDD",     str(resumen.get('bd_total', len(df_rds)))),
-        ("#1a1040", "#534AB7", "#7F77DD", "VPC",      str(resumen.get('vpc_total', len(df_vpc)))),
-        ("#0a1f1a", "#0F6E56", "#5DCAA5", "SUBNETS",  str(resumen.get('subnet_total', len(df_subnet)))),
-        ("#1a0f30", "#7F77DD", "#AFA9EC", "AURORA",   str(resumen.get('aurora_total', len(df_aurora)))),
-        ("#1a1a05", "#639922", "#97C459", "DYNAMO",   str(resumen.get('dynamo_total', len(df_dynamo)))),
-        ("#1a0f0a", "#993C1D", "#F0997B", "S3",       str(resumen.get('s3_total', len(df_s3)))),
-    ]
-    col1, col2, col3, col4 = st.columns(4)
-    col5, col6, col7, col8 = st.columns(4)
-    for i, (bg, borde, texto, label, valor) in enumerate(tarjetas):
-        col = [col1,col2,col3,col4,col5,col6,col7,col8][i]
-        with col:
-            st.markdown(f"""
-            <div style="background:{bg};border:1px solid {borde};border-radius:10px;
-                        padding:18px 12px;text-align:center;margin-bottom:4px">
-                <div style="font-size:11px;color:{texto};text-transform:uppercase;
-                            letter-spacing:0.06em;margin-bottom:8px">{label}</div>
-                <div style="font-size:28px;font-weight:500;color:#e8eaf0;
-                            font-family:monospace">{valor}</div>
-            </div>""", unsafe_allow_html=True)
-
-    st.markdown("")
-
-    contexto_perfil_region(perfil_activo, region_activa)
-
-    # ── Inventario agrupado por tipo ──────────────────────────────────────────
-    st.markdown('<p class="seccion-titulo">Inventario agrupado por tipo de componente</p>', unsafe_allow_html=True)
-
-    # Detectar si la cuenta tiene múltiples regiones
-    regiones_perfil = _regiones(perfil_activo)
-    multi_region    = len(regiones_perfil) > 1
-
-    grupos = [
-        ("🖥️", "EC2 — Instancias",    df_ec2,    ["nombre","tipo","estado","ip_privada","vpc"],          "ec2"),
-        ("⚡",  "Lambda — Funciones",  df_lambda, ["nombre","runtime","estado","memoria_mb","tags"],             "lambda"),
-        ("🌐",  "VPC — Redes",         df_vpc,    ["nombre","cidr","subnets","estado","internet_gateway"],"vpc"),
-        ("📡",  "Subnets",             df_subnet, ["nombre","vpc_id","cidr","az","publica"],              "subnet"),
-        ("🗄️",  "RDS — Instancias",    df_rds,    ["nombre","motor","version","estado","tipo"],           "rds"),
-        ("🌀",  "Aurora — Clusters",   df_aurora, ["nombre","motor","version","estado","miembros"] if "miembros" in df_aurora.columns else ["nombre","motor","version","estado"], "aurora"),
-        ("📦",  "DynamoDB — Tablas",   df_dynamo, ["nombre","estado","items","rcu","wcu"] if "items" in df_dynamo.columns else ["nombre","estado"], "dynamo"),
-        ("🪣",  "S3 — Buckets",        df_s3,     ["nombre","region","creado"],                           "s3"),
-    ]
-
-    TIPOS_MULTIREGION = {"ec2","lambda","vpc","rds","dynamo"}
-
-    for icono, titulo, df, columnas, tipo_key in grupos:
-        cols_validas = [c for c in columnas if c in df.columns]
-        count = len(df)
-        st.markdown(f"""
-        <div class="inv-group">
-            <div class="inv-group-title">{icono} {titulo} <span class="inv-group-count">{count}</span></div>
-        </div>""", unsafe_allow_html=True)
-
-        if multi_region and tipo_key in TIPOS_MULTIREGION:
-            # Dos columnas: una por región
-            col_r1, col_r2 = st.columns(2)
-            for col_r, region_iter in zip([col_r1, col_r2], regiones_perfil):
-                region_nombre = REGIONES_NOMBRES_APP.get(region_iter, region_iter)
-                with col_r:
-                    st.markdown(f"**{region_nombre}**")
-                    try:
-                        df_r = _df_region(perfil_activo, region_iter, tipo_key)
-                        cv   = [c for c in cols_validas if c in df_r.columns]
-                        if not df_r.empty and cv:
-                            st.dataframe(df_r[cv], use_container_width=True, hide_index=True)
-                            st.caption(f"{len(df_r)} componentes")
-                        else:
-                            st.caption("Sin componentes en esta región.")
-                    except Exception as ex:
-                        st.caption(f"Error: {ex}")
+    
+    # Cargar datos con caché local primero (sin AWS)
+    def _cargar_df_con_cache(perfil, region, tipo):
+        """Intenta caché local primero, si no existe carga de AWS"""
+        cache_key = f"df_{tipo}_{perfil}_{region}"
+        cached_data, _, _ = cache_manager.get(cache_key)
+        
+        if cached_data is not None:
+            return cached_data  # Del caché local
         else:
-            if not df.empty and cols_validas:
-                st.dataframe(df[cols_validas], use_container_width=True, hide_index=True)
-            else:
-                st.caption("    Sin componentes de este tipo en la cuenta.")
-        st.markdown("")
-
+            # Si no hay caché, cargar de AWS
+            df = _df_region(perfil, region, tipo)
+            # Guardar en caché
+            try:
+                cache_manager.set(cache_key, df)
+            except:
+                pass
+            return df
+    
+    try:
+        ec2_df    = _cargar_df_con_cache(perfil_activo, region_activa, "ec2")
+        rds_df    = _cargar_df_con_cache(perfil_activo, region_activa, "rds")
+        lambda_df = _cargar_df_con_cache(perfil_activo, region_activa, "lambda")
+        vpc_df    = _cargar_df_con_cache(perfil_activo, region_activa, "vpc")
+    except:
+        ec2_df = pd.DataFrame()
+        rds_df = pd.DataFrame()
+        lambda_df = pd.DataFrame()
+        vpc_df = pd.DataFrame()
+    
+    st.markdown("")
+    
+    # EC2
+    st.markdown('<p class="seccion-titulo">🖥️ Instancias EC2</p>', unsafe_allow_html=True)
+    try:
+        if not ec2_df.empty:
+            st.dataframe(ec2_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Sin instancias EC2 en esta región")
+    except Exception as e:
+        st.error(f"Error: {e}")
+    
+    st.markdown("")
+    
+    # RDS
+    st.markdown('<p class="seccion-titulo">🗄️ Bases de datos RDS</p>', unsafe_allow_html=True)
+    try:
+        if not rds_df.empty:
+            st.dataframe(rds_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Sin bases de datos RDS en esta región")
+    except Exception as e:
+        st.error(f"Error: {e}")
+    
+    st.markdown("")
+    
+    # Lambda
+    st.markdown('<p class="seccion-titulo">⚡ Funciones Lambda</p>', unsafe_allow_html=True)
+    try:
+        if not lambda_df.empty:
+            st.dataframe(lambda_df[["nombre","runtime","estado","memoria_mb"]] if "memoria_mb" in lambda_df.columns else lambda_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Sin funciones Lambda en esta región")
+    except Exception as e:
+        st.error(f"Error: {e}")
+    
+    st.markdown("")
+    
+    # VPC
+    st.markdown('<p class="seccion-titulo">🌐 Virtual Private Clouds</p>', unsafe_allow_html=True)
+    try:
+        if not vpc_df.empty:
+            st.dataframe(vpc_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Sin VPCs en esta región")
+    except Exception as e:
+        st.error(f"Error: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 2 — LAMBDA
+# SECCIÓN 2 — S3
 # ═══════════════════════════════════════════════════════════════════════════════
-
 
 elif seccion == "🪣 S3 — Buckets":
-    st.markdown('<p class="header-titulo">S3 — Buckets</p>', unsafe_allow_html=True)
-    st.markdown('<p class="header-sub">Todos los buckets en la cuenta seleccionada</p>', unsafe_allow_html=True)
+    st.markdown('<p class="header-titulo">S3 Buckets</p>', unsafe_allow_html=True)
+    st.markdown('<p class="header-sub">Almacenamiento en S3</p>', unsafe_allow_html=True)
     st.markdown("")
-    perfil_s3, region_s3 = selector_cuenta("s3")
-    contexto_perfil_region(perfil_s3, region_s3)
-    df_s3 = get_s3_df() if perfil_s3 == "inventario" else get_s3_perfil(perfil_s3)
+    
+    # Selector ESTÁTICO (sin llamadas a AWS)
+    opciones_dict = {label: (perfil, region) for perfil, region, label in OPCIONES_CUENTA_REGION_STATIC}
+    col1, col2 = st.columns([4, 1])
+    
+    with col1:
+        sel = st.selectbox("Selecciona Cuenta / Región", list(opciones_dict.keys()), key="cta_s3")
+    
+    perfil_activo, region_activa = opciones_dict[sel]
+    
+    # Detectar cambio en selector y forzar rerun
+    if "s3_perfil_anterior" not in st.session_state:
+        st.session_state.s3_perfil_anterior = perfil_activo
+    
+    if st.session_state.s3_perfil_anterior != perfil_activo:
+        st.session_state.s3_perfil_anterior = perfil_activo
+        st.rerun()
+    
+    st.markdown("")
+    
+    # Contexto del perfil y región
+    REGIONES_NOMBRES_APP = {
+        "us-east-1": "us-east-1 Virginia",
+        "us-east-2": "us-east-2 Ohio",
+        "us-west-1": "us-west-1 California",
+        "us-west-2": "us-west-2 Oregon",
+        "sa-east-1": "sa-east-1 São Paulo",
+    }
+    d   = get_identity_perfil(perfil_activo)
+    nom = d.get("account_name", perfil_activo)
+    lbl = f"{nom} ({d['account_id']})" if d.get("account_id","—") != "—" else nom
+    usr = d["arn"].split("/")[-1] if "/" in d.get("arn","") else d.get("arn","—")
+    region_nombre = REGIONES_NOMBRES_APP.get(region_activa, region_activa)
+    st.markdown(f'''<div class="ctx-box"><strong>Cuenta:</strong> {lbl} &nbsp;·&nbsp;
+        <strong>Región:</strong> {region_nombre} &nbsp;·&nbsp;
+        <strong>Usuario:</strong> {usr}</div>''', unsafe_allow_html=True)
+    
+    st.markdown('<p class="seccion-titulo">🪣 Buckets</p>', unsafe_allow_html=True)
+    
+    # Mostrar indicador de carga
+    with st.status("🔄 Cargando buckets S3...", expanded=True) as status:
+        try:
+            s3_df = get_s3_df(perfil_activo)
+            status.update(label="✅ Buckets cargados", state="complete")
+            
+            if not s3_df.empty:
+                st.dataframe(s3_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("Sin buckets S3")
+        except Exception as e:
+            status.update(label="❌ Error al cargar", state="error")
+            st.error(f"Error: {e}")
 
-    if df_s3.empty:
-        st.info("No se encontraron buckets S3 en esta cuenta.")
-    else:
-        st.metric("Total Buckets", len(df_s3))
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECCIÓN 3 — LAMBDA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif seccion == "⚡ Lambda":
+    st.markdown('<p class="header-titulo">AWS Lambda</p>', unsafe_allow_html=True)
+    st.markdown('<p class="header-sub">Funciones Lambda y replicación entre regiones</p>', unsafe_allow_html=True)
+    st.markdown("")
+    
+    # Tabs para dos vistas
+    tab1, tab2 = st.tabs(["📋 Lambda por región", "🔄 Comparación Producción (Virginia ↔ Ohio)"])
+    
+    with tab1:
         st.markdown("")
-        st.dataframe(
-            df_s3.rename(columns={"nombre": "Bucket"}),
-            use_container_width=True, hide_index=True,
-        )
-
+        # Selector ESTÁTICO
+        opciones_dict = {label: (perfil, region) for perfil, region, label in OPCIONES_CUENTA_REGION_STATIC}
+        col1, col2 = st.columns([4, 1])
+        
+        with col1:
+            sel = st.selectbox("Selecciona Cuenta / Región", list(opciones_dict.keys()), key="cta_lambda")
+        
+        perfil_activo, region_activa = opciones_dict[sel]
+        
+        # Detectar cambio en selector y forzar rerun
+        if "lambda_perfil_anterior" not in st.session_state:
+            st.session_state.lambda_perfil_anterior = perfil_activo
+        
+        if st.session_state.lambda_perfil_anterior != perfil_activo:
+            st.session_state.lambda_perfil_anterior = perfil_activo
+            st.rerun()
+        
+        st.markdown("")
+        
+        # Contexto
+        REGIONES_NOMBRES_APP = {
+            "us-east-1": "us-east-1 Virginia",
+            "us-east-2": "us-east-2 Ohio",
+            "us-west-1": "us-west-1 California",
+            "us-west-2": "us-west-2 Oregon",
+            "sa-east-1": "sa-east-1 São Paulo",
+        }
+        d   = get_identity_perfil(perfil_activo)
+        nom = d.get("account_name", perfil_activo)
+        lbl = f"{nom} ({d['account_id']})" if d.get("account_id","—") != "—" else nom
+        usr = d["arn"].split("/")[-1] if "/" in d.get("arn","") else d.get("arn","—")
+        region_nombre = REGIONES_NOMBRES_APP.get(region_activa, region_activa)
+        st.markdown(f'''<div class="ctx-box"><strong>Cuenta:</strong> {lbl} &nbsp;·&nbsp;
+            <strong>Región:</strong> {region_nombre} &nbsp;·&nbsp;
+            <strong>Usuario:</strong> {usr}</div>''', unsafe_allow_html=True)
+        
+        st.markdown('<p class="seccion-titulo">⚡ Funciones Lambda</p>', unsafe_allow_html=True)
+        
+        # Mostrar indicador de carga
+        with st.status("🔄 Cargando funciones Lambda...", expanded=True) as status:
+            try:
+                lambda_df = get_lambda_df(perfil_activo, region_activa)
+                status.update(label="✅ Lambda cargadas", state="complete")
+                
+                if not lambda_df.empty:
+                    # Métricas rápidas
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Total", len(lambda_df))
+                    with col2:
+                        cert = len(lambda_df[lambda_df["label"] == "🟢 CERT"])
+                        st.metric("CERT", cert)
+                    with col3:
+                        prod = len(lambda_df[lambda_df["label"] == "🔵 PROD"])
+                        st.metric("PROD", prod)
+                    with col4:
+                        sin = len(lambda_df[lambda_df["label"] == "⚪ SIN LABEL"])
+                        st.metric("Sin label", sin)
+                    
+                    st.markdown("")
+                    
+                    # Tabla
+                    st.dataframe(
+                        lambda_df[[
+                            "nombre", "label", "versión", "runtime", "memoria", 
+                            "timeout", "api", "última_actualización", "estado"
+                        ]].rename(columns={
+                            "nombre": "Nombre Lambda",
+                            "label": "Etiqueta",
+                            "versión": "Versión",
+                            "runtime": "Runtime",
+                            "memoria": "Memoria (MB)",
+                            "timeout": "Timeout (s)",
+                            "api": "API Gateway",
+                            "última_actualización": "Actualización",
+                            "estado": "Estado"
+                        }),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.info("Sin funciones Lambda en esta región")
+            except Exception as e:
+                status.update(label="❌ Error al cargar", state="error")
+                st.error(f"Error: {e}")
+    
+    with tab2:
+        st.markdown("")
+        st.markdown('<p class="seccion-titulo">🔄 Replicación: Virginia vs Ohio (Producción)</p>', unsafe_allow_html=True)
+        st.markdown("Análisis de Lambdas con CERT o PROD replicadas entre ambas regiones")
+        st.markdown("")
+        
+        with st.status("🔄 Analizando replicación...", expanded=True) as status:
+            try:
+                comparacion = comparar_lambdas_produccion()
+                status.update(label="✅ Análisis completado", state="complete")
+                
+                # Métricas principales
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric(
+                        "Virginia (CERT+PROD)",
+                        comparacion["total_virginia"],
+                        delta=f"{comparacion['replicadas']} replicadas"
+                    )
+                with col2:
+                    st.metric(
+                        "Ohio (CERT+PROD)",
+                        comparacion["total_ohio"],
+                        delta=f"{comparacion['replicadas']} replicadas"
+                    )
+                with col3:
+                    porcentaje = (comparacion["replicadas"] / comparacion["total_virginia"] * 100) if comparacion["total_virginia"] > 0 else 0
+                    st.metric(
+                        "Replicación",
+                        f"{porcentaje:.0f}%",
+                        delta=f"{comparacion['replicadas']} iguales"
+                    )
+                with col4:
+                    diferencias = len(comparacion["solo_virginia"]) + len(comparacion["solo_ohio"])
+                    st.metric(
+                        "Diferencias",
+                        diferencias,
+                        delta="⚠️ Requiere revisión" if diferencias > 0 else "✅ Sincronizadas"
+                    )
+                
+                st.markdown("")
+                
+                # Alertas de diferencias
+                if comparacion["solo_virginia"]:
+                    st.warning(f"**🔴 Solo en Virginia ({len(comparacion['solo_virginia'])}):** {', '.join(comparacion['solo_virginia'][:5])}")
+                
+                if comparacion["solo_ohio"]:
+                    st.warning(f"**🔴 Solo en Ohio ({len(comparacion['solo_ohio'])}):** {', '.join(comparacion['solo_ohio'][:5])}")
+                
+                if comparacion["solo_virginia"] or comparacion["solo_ohio"]:
+                    st.markdown("")
+                    st.error("⚠️ **DESINCRONIZACIÓN DETECTADA** - Se recomienda revisar y replicar las Lambdas faltantes")
+                else:
+                    st.success("✅ **TODAS LAS LAMBDAS REPLICADAS CORRECTAMENTE** - Virginia y Ohio están en sincronía")
+                
+                st.markdown("")
+                st.markdown("**Lambda replicadas en ambas regiones:**")
+                if comparacion["replicadas_list"]:
+                    cols = st.columns(2)
+                    for i, nombre in enumerate(comparacion["replicadas_list"]):
+                        with cols[i % 2]:
+                            st.caption(f"✅ {nombre}")
+                else:
+                    st.info("Sin Lambda replicadas")
+                    
+            except Exception as e:
+                status.update(label="❌ Error en análisis", state="error")
+                st.error(f"Error: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN — USUARIOS IAM
+# SECCIÓN 4 — API GATEWAY
 # ═══════════════════════════════════════════════════════════════════════════════
 
+elif seccion == "🔌 API Gateway":
+    st.markdown('<p class="header-titulo">API Gateway</p>', unsafe_allow_html=True)
+    st.markdown('<p class="header-sub">APIs REST y configuraciones</p>', unsafe_allow_html=True)
+    st.markdown("")
+    
+    # Selector ESTÁTICO
+    opciones_dict = {label: (perfil, region) for perfil, region, label in OPCIONES_CUENTA_REGION_STATIC}
+    col1, col2 = st.columns([4, 1])
+    
+    with col1:
+        sel = st.selectbox("Selecciona Cuenta / Región", list(opciones_dict.keys()), key="cta_api")
+    
+    perfil_activo, region_activa = opciones_dict[sel]
+    
+    # Detectar cambio en selector y forzar rerun
+    if "api_perfil_anterior" not in st.session_state:
+        st.session_state.api_perfil_anterior = perfil_activo
+    
+    if st.session_state.api_perfil_anterior != perfil_activo:
+        st.session_state.api_perfil_anterior = perfil_activo
+        st.rerun()
+    
+    st.markdown("")
+    
+    # Contexto
+    REGIONES_NOMBRES_APP = {
+        "us-east-1": "us-east-1 Virginia",
+        "us-east-2": "us-east-2 Ohio",
+        "us-west-1": "us-west-1 California",
+        "us-west-2": "us-west-2 Oregon",
+        "sa-east-1": "sa-east-1 São Paulo",
+    }
+    d   = get_identity_perfil(perfil_activo)
+    nom = d.get("account_name", perfil_activo)
+    lbl = f"{nom} ({d['account_id']})" if d.get("account_id","—") != "—" else nom
+    usr = d["arn"].split("/")[-1] if "/" in d.get("arn","") else d.get("arn","—")
+    region_nombre = REGIONES_NOMBRES_APP.get(region_activa, region_activa)
+    st.markdown(f'''<div class="ctx-box"><strong>Cuenta:</strong> {lbl} &nbsp;·&nbsp;
+        <strong>Región:</strong> {region_nombre} &nbsp;·&nbsp;
+        <strong>Usuario:</strong> {usr}</div>''', unsafe_allow_html=True)
+    
+    # Tabs para dos vistas
+    tab1, tab2 = st.tabs(["📋 APIs REST", "🔗 Conexiones API ↔ Lambda"])
+    
+    with tab1:
+        st.markdown('<p class="seccion-titulo">🔌 APIs REST</p>', unsafe_allow_html=True)
+        
+        # Mostrar indicador de carga
+        with st.status("🔄 Cargando APIs...", expanded=True) as status:
+            try:
+                api_df = get_api_df(perfil_activo, region_activa)
+                status.update(label="✅ APIs cargadas", state="complete")
+                
+                if not api_df.empty:
+                    # Métricas rápidas
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Total APIs", len(api_df))
+                    with col2:
+                        st.metric("Total Recursos", api_df["recursos"].sum())
+                    with col3:
+                        st.metric("Total Métodos", api_df["num_métodos"].sum())
+                    with col4:
+                        st.metric("Total Etapas", api_df["num_etapas"].sum())
+                    
+                    st.markdown("")
+                    
+                    # Tabla
+                    st.dataframe(
+                        api_df[[
+                            "nombre", "recursos", "métodos", "etapas", "creado", "estado"
+                        ]].rename(columns={
+                            "nombre": "Nombre API",
+                            "recursos": "Recursos",
+                            "métodos": "Métodos",
+                            "etapas": "Etapas",
+                            "creado": "Creado",
+                            "estado": "Estado"
+                        }),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.info("Sin APIs REST en esta región")
+            except Exception as e:
+                status.update(label="❌ Error al cargar", state="error")
+                st.error(f"Error: {e}")
+    
+    with tab2:
+        st.markdown('<p class="seccion-titulo">🔗 Mapeo API ↔ Lambda</p>', unsafe_allow_html=True)
+        st.markdown("Todas las APIs y sus Lambdas asociadas")
+        st.markdown("")
+        
+        with st.status("🔄 Analizando integraciones...", expanded=True) as status:
+            try:
+                mapping_df = get_api_lambda_mapping(perfil_activo, region_activa)
+                status.update(label="✅ Análisis completado", state="complete")
+                
+                if not mapping_df.empty:
+                    # Métricas
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Total Conexiones", len(mapping_df))
+                    with col2:
+                        apis_unicas = mapping_df["api"].nunique()
+                        st.metric("APIs", apis_unicas)
+                    with col3:
+                        lambdas_unicas = mapping_df["lambda"].nunique()
+                        st.metric("Lambdas", lambdas_unicas)
+                    with col4:
+                        metodos_unicos = mapping_df["metodo"].nunique()
+                        st.metric("Métodos HTTP", metodos_unicos)
+                    
+                    st.markdown("")
+                    
+                    # Crear tabla resumida limpia
+                    st.markdown("### 📋 API → Lambda Mapping")
+                    
+                    # Agrupar por API para mostrar de forma más clara
+                    apis_group = mapping_df.groupby("api").apply(
+                        lambda x: pd.Series({
+                            "Lambdas": ", ".join(x["lambda"].unique()),
+                            "Métodos": ", ".join(x["metodo"].unique()),
+                            "Rutas": ", ".join(x["ruta"].unique()),
+                            "Conexiones": len(x)
+                        })
+                    ).reset_index()
+                    
+                    st.dataframe(
+                        apis_group.rename(columns={
+                            "api": "API Gateway",
+                            "Lambdas": "🔗 Función Lambda",
+                            "Métodos": "HTTP",
+                            "Rutas": "Rutas/Paths",
+                            "Conexiones": "Total"
+                        }),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                    
+                    st.markdown("")
+                    st.markdown("### ⚡ Lambda → API Mapping")
+                    
+                    # Agrupar por Lambda para mostrar qué APIs la usan
+                    lambdas_group = mapping_df.groupby("lambda").apply(
+                        lambda x: pd.Series({
+                            "APIs": ", ".join(x["api"].unique()),
+                            "Métodos": ", ".join(x["metodo"].unique()),
+                            "Rutas": ", ".join(x["ruta"].unique()),
+                            "Conexiones": len(x)
+                        })
+                    ).reset_index()
+                    
+                    st.dataframe(
+                        lambdas_group.rename(columns={
+                            "lambda": "Función Lambda",
+                            "APIs": "🔗 APIs que la usan",
+                            "Métodos": "HTTP",
+                            "Rutas": "Rutas/Paths",
+                            "Conexiones": "Total"
+                        }),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                    
+                    st.markdown("")
+                    st.markdown("### 🔍 Detalle Completo")
+                    st.markdown("Cada integración API → Lambda → Ruta → Método HTTP")
+                    
+                    # Tabla detallada completa
+                    st.dataframe(
+                        mapping_df[[
+                            "api", "lambda", "ruta", "metodo", "tipo_integracion", "estado"
+                        ]].rename(columns={
+                            "api": "API Gateway",
+                            "lambda": "Función Lambda",
+                            "ruta": "Ruta",
+                            "metodo": "Método HTTP",
+                            "tipo_integracion": "Tipo Integración",
+                            "estado": "Estado"
+                        }).sort_values("API Gateway"),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.info("Sin integraciones API → Lambda detectadas en esta región")
+            except Exception as e:
+                status.update(label="❌ Error en análisis", state="error")
+                st.error(f"Error: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECCIÓN 5 — IAM
+# ═══════════════════════════════════════════════════════════════════════════════
 
 elif seccion == "👥 Usuarios IAM":
     st.markdown('<p class="header-titulo">Usuarios IAM</p>', unsafe_allow_html=True)
-    st.markdown('<p class="header-sub">Cuentas de acceso, estado y políticas de permisos</p>', unsafe_allow_html=True)
+    st.markdown('<p class="header-sub">Gestión de identidades y acceso</p>', unsafe_allow_html=True)
     st.markdown("")
-    perfil_iam, region_iam = selector_cuenta("iam")
-    contexto_perfil_region(perfil_iam, region_iam)
-    df_iam = get_iam_users_df() if perfil_iam == "inventario" else get_iam_users_perfil(perfil_iam)
-
-    if df_iam.empty:
-        st.info("No se encontraron usuarios IAM o falta el permiso IAMReadOnlyAccess.")
-    else:
-        total      = len(df_iam)
-        activos    = len(df_iam[df_iam["estado"].str.contains("Activo",  na=False)])
-        bloqueados = len(df_iam[df_iam["estado"].str.contains("Bloqueado", na=False)])
-        sin_mfa    = len(df_iam[df_iam["mfa"].str.contains("Sin MFA", na=False)])
-
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1: st.metric("Total usuarios",  total)
-        with c2: st.metric("🟢 Activos",      activos)
-        with c3: st.metric("🔴 Bloqueados",   bloqueados,  delta="revisar" if bloqueados else None, delta_color="inverse")
-        with c4: st.metric("⚠️ Sin MFA",      sin_mfa,     delta="riesgo" if sin_mfa else None, delta_color="inverse")
-        with c5: st.metric("Tipo servicio",   len(df_iam[df_iam["tipo"] == "Servicio"]) if "tipo" in df_iam.columns else 0)
-
-        st.markdown("")
-
-        col_f1, col_f2, col_f3 = st.columns(3)
-        with col_f1: filtro_estado = st.multiselect("Estado", df_iam["estado"].unique(), default=list(df_iam["estado"].unique()))
-        with col_f2: filtro_tipo   = st.multiselect("Tipo",   df_iam["tipo"].unique(),   default=list(df_iam["tipo"].unique()))
-        with col_f3: filtro_mfa    = st.multiselect("MFA",    df_iam["mfa"].unique(),    default=list(df_iam["mfa"].unique()))
-
-        df_fil = df_iam[
-            df_iam["estado"].isin(filtro_estado) &
-            df_iam["tipo"].isin(filtro_tipo) &
-            df_iam["mfa"].isin(filtro_mfa)
-        ]
-
-        st.markdown("")
-        st.markdown('<p class="seccion-titulo">Detalle de usuarios</p>', unsafe_allow_html=True)
-        st.dataframe(
-            df_fil[["nombre","tipo","estado","mfa","politicas","n_politicas","ultimo_acceso","pwd_rotacion","access_keys"]].rename(columns={
-                "nombre":"Usuario","tipo":"Tipo","estado":"Estado","mfa":"MFA",
-                "politicas":"Políticas","n_politicas":"N° políticas",
-                "ultimo_acceso":"Último acceso","pwd_rotacion":"Rotación pwd","access_keys":"Access Keys",
-            }),
-            use_container_width=True, hide_index=True,
-        )
-        st.caption(f"Mostrando {len(df_fil)} de {total} usuarios")
-
-        st.markdown("")
-        usuario_sel = st.selectbox("Ver detalle de usuario", df_fil["nombre"].tolist())
-        if usuario_sel:
-            row = df_fil[df_fil["nombre"] == usuario_sel].iloc[0]
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.markdown(f"""
-                <div style="background:#1a1d27;border:1px solid #2a2d3a;border-radius:10px;padding:16px">
-                    <div style="font-size:14px;font-weight:500;color:#e8eaf0;margin-bottom:12px">{row['nombre']}</div>
-                    <div style="font-size:12px;color:#5a5e72;margin-bottom:4px">Tipo: <span style="color:#c8ccd4">{row['tipo']}</span></div>
-                    <div style="font-size:12px;color:#5a5e72;margin-bottom:4px">Estado: <span style="color:#c8ccd4">{row['estado']}</span></div>
-                    <div style="font-size:12px;color:#5a5e72;margin-bottom:4px">MFA: <span style="color:#c8ccd4">{row['mfa']}</span></div>
-                    <div style="font-size:12px;color:#5a5e72;margin-bottom:4px">Último acceso: <span style="color:#c8ccd4">{row['ultimo_acceso']}</span></div>
-                    <div style="font-size:12px;color:#5a5e72;margin-bottom:4px">Rotación: <span style="color:#c8ccd4">{row['pwd_rotacion']}</span></div>
-                    <div style="font-size:12px;color:#5a5e72;margin-bottom:4px">Access Keys activos: <span style="color:#c8ccd4">{row['access_keys']}</span></div>
-                    <div style="font-size:11px;color:#3a3e52;margin-top:8px;font-family:monospace">{row['arn']}</div>
-                </div>""", unsafe_allow_html=True)
-            with col_b:
-                st.markdown('<p style="font-size:12px;color:#5a5e72;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px">Políticas asignadas</p>', unsafe_allow_html=True)
-                for pol in str(row["politicas"]).split(", "):
-                    color = "#e05252" if "Administrator" in pol else ("#d4a017" if "Power" in pol else "#3a7bd5")
-                    bg    = "#1f0a0a" if "Administrator" in pol else ("#2a1a05" if "Power" in pol else "#0c1f3a")
-                    st.markdown(f"""
-                    <div style="background:{bg};border:1px solid {color};border-radius:6px;
-                                padding:8px 12px;margin-bottom:6px;font-size:12px;
-                                font-family:monospace;color:{color}">{pol}</div>""", unsafe_allow_html=True)
-
-        if sin_mfa > 0:
-            st.warning(f"⚠️ {sin_mfa} usuario(s) sin MFA — riesgo de seguridad.")
+    
+    # Selector ESTÁTICO (sin llamadas a AWS)
+    opciones_dict = {label: (perfil, region) for perfil, region, label in OPCIONES_CUENTA_REGION_STATIC}
+    col1, col2 = st.columns([4, 1])
+    
+    with col1:
+        sel = st.selectbox("Selecciona Cuenta / Región", list(opciones_dict.keys()), key="cta_iam")
+    
+    perfil_activo, region_activa = opciones_dict[sel]
+    
+    # Detectar cambio en selector y forzar rerun
+    if "iam_perfil_anterior" not in st.session_state:
+        st.session_state.iam_perfil_anterior = perfil_activo
+    
+    if st.session_state.iam_perfil_anterior != perfil_activo:
+        st.session_state.iam_perfil_anterior = perfil_activo
+        st.rerun()
+    
+    st.markdown("")
+    
+    # Contexto del perfil y región
+    REGIONES_NOMBRES_APP = {
+        "us-east-1": "us-east-1 Virginia",
+        "us-east-2": "us-east-2 Ohio",
+        "us-west-1": "us-west-1 California",
+        "us-west-2": "us-west-2 Oregon",
+        "sa-east-1": "sa-east-1 São Paulo",
+    }
+    d   = get_identity_perfil(perfil_activo)
+    nom = d.get("account_name", perfil_activo)
+    lbl = f"{nom} ({d['account_id']})" if d.get("account_id","—") != "—" else nom
+    usr = d["arn"].split("/")[-1] if "/" in d.get("arn","") else d.get("arn","—")
+    region_nombre = REGIONES_NOMBRES_APP.get(region_activa, region_activa)
+    st.markdown(f'''<div class="ctx-box"><strong>Cuenta:</strong> {lbl} &nbsp;·&nbsp;
+        <strong>Región:</strong> {region_nombre} &nbsp;·&nbsp;
+        <strong>Usuario:</strong> {usr}</div>''', unsafe_allow_html=True)
+    
+    st.markdown('<p class="seccion-titulo">👥 Usuarios</p>', unsafe_allow_html=True)
+    
+    # Mostrar indicador de carga
+    with st.status("🔄 Cargando usuarios IAM...", expanded=True) as status:
+        try:
+            users_df = get_iam_users_df(perfil_activo)
+            status.update(label="✅ Usuarios cargados", state="complete")
+            
+            if not users_df.empty:
+                st.dataframe(users_df[["nombre","tipo","estado","mfa","n_politicas","ultimo_acceso"]], use_container_width=True, hide_index=True)
+            else:
+                st.info("Sin usuarios IAM")
+        except Exception as e:
+            status.update(label="❌ Error al cargar", state="error")
+            st.error(f"Error: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN — MULTI-REGIÓN
+# SECCIÓN 4 — MULTI-REGIÓN
 # ═══════════════════════════════════════════════════════════════════════════════
+
 elif seccion == "🗺️ Multi-región":
-    st.markdown('<p class="header-titulo">Comparación multi-región</p>', unsafe_allow_html=True)
-    st.markdown('<p class="header-sub">Distribución de componentes por región en la cuenta seleccionada</p>', unsafe_allow_html=True)
+    st.markdown('<p class="header-titulo">Multi-región</p>', unsafe_allow_html=True)
+    st.markdown('<p class="header-sub">Comparación de infraestructura entre regiones</p>', unsafe_allow_html=True)
     st.markdown("")
-
-    # Solo aplica a cuentas con múltiples regiones
-    perfil_mr, region_mr = selector_cuenta("mr")
-    contexto_perfil(perfil_mr)
-
+    
+    # Selector de cuenta
+    OPCIONES_CUENTA_MULTI = [
+        ("afex-prod", "us-east-1"),
+        ("afex-prod", "us-east-2"),
+    ]
+    
+    opciones_mr = {f"{p} - {r}": (p, r) for p, r in OPCIONES_CUENTA_MULTI}
+    
+    col_sel1, col_sel2 = st.columns([2, 1])
+    with col_sel1:
+        sel_mr = st.selectbox("Selecciona cuenta para multi-región", list(opciones_mr.keys()), key="mr_selector")
+    perfil_mr, region_base = opciones_mr[sel_mr]
+    
+    with col_sel2:
+        if st.button("🔄 Refresh datos", key="mr_refresh"):
+            st.cache_data.clear()
+            st.rerun()
+    
     st.markdown("")
-
-    with st.spinner("Consultando regiones..."):
-        datos_regiones = get_comparacion_regiones(perfil_mr)
-
-    if not datos_regiones:
-        st.info("No hay regiones configuradas para esta cuenta.")
-    elif len(datos_regiones) == 1:
-        st.info(f"Esta cuenta solo tiene 1 región configurada: **{datos_regiones[0]['region_nombre']}**. "
+    
+    # Obtener regiones de esta cuenta
+    regiones_cuenta = _regiones(perfil_mr)
+    
+    if len(regiones_cuenta) <= 1:
+        st.markdown('<p class="seccion-titulo">Estado</p>', unsafe_allow_html=True)
+        st.info(f"Esta cuenta solo tiene 1 región configurada: **{regiones_cuenta[0]}**. "
                 "Para agregar más regiones, edita `PERFILES` en `conector_aws.py`.")
     else:
-        # ── Tarjetas por región ──
+        # Cargar datos de cada región
+        datos_regiones = []
+        for region in regiones_cuenta:
+            try:
+                res_region = get_resumen_region(perfil_mr, region)
+                datos_regiones.append(res_region)
+            except:
+                datos_regiones.append({"_error": f"No se pudo cargar {region}"})
+        
+        # Tarjetas por región
         st.markdown('<p class="seccion-titulo">Resumen por región</p>', unsafe_allow_html=True)
         colores = [("#0c2a4a","#185FA5","#7fb8f0"), ("#0a2a1f","#0F6E56","#3ecf8e"),
                    ("#1a1040","#534AB7","#a09ee0"), ("#2a1a05","#854F0B","#d4a017")]
@@ -484,7 +1187,7 @@ elif seccion == "🗺️ Multi-región":
                 <div style="background:{bg};border:1px solid {borde};border-radius:10px;
                             padding:16px;text-align:center">
                     <div style="font-size:0.72rem;color:{texto};text-transform:uppercase;
-                                letter-spacing:0.08em;margin-bottom:6px">{dr['region_nombre']}</div>
+                                letter-spacing:0.08em;margin-bottom:6px">{dr.get('region_nombre', dr.get('region', 'N/A'))}</div>
                     <div style="font-size:0.72rem;color:{'#e05252' if error else '#5a5e72'};margin-top:4px">
                         {'❌ ' + dr.get('_error','Error')[:40] if error else '✅ Conectado'}
                     </div>
@@ -492,7 +1195,7 @@ elif seccion == "🗺️ Multi-región":
 
         st.markdown("")
 
-        # ── Tabla comparativa ──
+        # Tabla comparativa
         st.markdown('<p class="seccion-titulo">Comparación de componentes entre regiones</p>', unsafe_allow_html=True)
 
         componentes = ["EC2 (total)", "EC2 (running)", "RDS", "Aurora", "Lambda", "DynamoDB", "VPC", "Subnets"]
@@ -503,18 +1206,19 @@ elif seccion == "🗺️ Multi-región":
         for comp, key in zip(componentes, keys):
             fila = {"Componente": comp}
             for dr in datos_regiones:
-                fila[dr["region_nombre"]] = dr.get(key, 0)
+                region_nombre = dr.get('region_nombre', dr.get('region', 'N/A'))
+                fila[region_nombre] = dr.get(key, 0)
             filas.append(fila)
 
         df_mr = pd.DataFrame(filas)
 
         # Columna diferencia si hay exactamente 2 regiones
         if len(datos_regiones) == 2:
-            r1 = datos_regiones[0]["region_nombre"]
-            r2 = datos_regiones[1]["region_nombre"]
+            r1 = datos_regiones[0].get('region_nombre', datos_regiones[0].get('region', 'Región 1'))
+            r2 = datos_regiones[1].get('region_nombre', datos_regiones[1].get('region', 'Región 2'))
             df_mr["Diferencia"] = df_mr.apply(
-                lambda row: "✅ Igual" if row[r1] == row[r2]
-                            else f"⚠️ {abs(row[r1] - row[r2])} diferencia",
+                lambda row: "✅ Igual" if row.get(r1, 0) == row.get(r2, 0)
+                            else f"⚠️ {abs(row.get(r1, 0) - row.get(r2, 0))} diferencia",
                 axis=1
             )
 
@@ -522,9 +1226,9 @@ elif seccion == "🗺️ Multi-región":
 
         st.markdown("")
 
-        # ── Gráfico comparativo ──
+        # Gráfico comparativo
         st.markdown('<p class="seccion-titulo">Distribución gráfica por región</p>', unsafe_allow_html=True)
-        nombres_regiones = [dr["region_nombre"] for dr in datos_regiones]
+        nombres_regiones = [dr.get('region_nombre', dr.get('region', 'N/A')) for dr in datos_regiones]
         df_graf = df_mr[df_mr[nombres_regiones].sum(axis=1) > 0].copy()
         if not df_graf.empty:
             df_melt = df_graf.melt(
@@ -546,7 +1250,7 @@ elif seccion == "🗺️ Multi-región":
             )
             st.plotly_chart(fig, use_container_width=True)
 
-        # ── Alertas de diferencia ──
+        # Alertas de diferencia
         if len(datos_regiones) == 2 and "Diferencia" in df_mr.columns:
             difs = df_mr[df_mr["Diferencia"].str.contains("⚠️", na=False)]
             if not difs.empty:
@@ -556,7 +1260,7 @@ elif seccion == "🗺️ Multi-región":
                     <div class="alerta-aviso">
                         <strong>{row["Componente"]}</strong> — {row["Diferencia"]}<br>
                         <span style="color:#5a5e72;font-size:0.8rem">
-                        {r1}: {row[r1]} &nbsp;·&nbsp; {r2}: {row[r2]}
+                        {r1}: {row.get(r1, 0)} &nbsp;·&nbsp; {r2}: {row.get(r2, 0)}
                         </span>
                     </div>""", unsafe_allow_html=True)
             else:
@@ -565,27 +1269,28 @@ elif seccion == "🗺️ Multi-región":
         st.markdown("")
         st.info("Para agregar más regiones a una cuenta: edita la lista `regiones` en `PERFILES` dentro de `conector_aws.py`.")
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 7 — MULTI-CUENTA
+# SECCIÓN 5 — MULTI-CUENTA
 # ═══════════════════════════════════════════════════════════════════════════════
-
 
 elif seccion == "🌍 Multi-cuenta":
     st.markdown('<p class="header-titulo">Multi-cuenta</p>', unsafe_allow_html=True)
     st.markdown('<p class="header-sub">Inventario real de todas las cuentas AWS configuradas</p>', unsafe_allow_html=True)
     st.markdown("")
 
-    # ✅ ACTUALIZADO: Lista de 4 perfiles configurados
+    # Lista de 4 perfiles configurados
     PERFILES_MULTI = ["afex-des", "afex-prod", "afex-peru", "afex-digital"]
 
     # Cargar identidad y resumen de cada cuenta
     with st.spinner("Consultando todas las cuentas AWS..."):
         datos_cuentas = []
         for perfil in PERFILES_MULTI:
-            id_cuenta  = get_identity_perfil(perfil)
-            res_cuenta = get_resumen_perfil(perfil)
-            datos_cuentas.append({"identidad": id_cuenta, "resumen": res_cuenta})
+            try:
+                id_cuenta  = get_identity_perfil(perfil)
+                res_cuenta = get_resumen_perfil(perfil)
+                datos_cuentas.append({"identidad": id_cuenta, "resumen": res_cuenta})
+            except:
+                datos_cuentas.append({"identidad": {"account_name": perfil, "account_id": "N/A"}, "resumen": {"_error": "Error"}})
 
     # Tarjetas por cuenta
     st.markdown('<p class="seccion-titulo">Estado de las cuentas</p>', unsafe_allow_html=True)
@@ -603,9 +1308,9 @@ elif seccion == "🌍 Multi-cuenta":
             <div style="background:{bg};border:1px solid {borde};border-radius:10px;
                         padding:16px;text-align:center">
                 <div style="font-size:0.7rem;color:{texto};text-transform:uppercase;
-                            letter-spacing:0.08em;margin-bottom:4px">{idc['region']}</div>
-                <div style="font-size:1rem;font-weight:500;color:#e8eaf0">{idc['account_name']}</div>
-                <div style="font-size:0.72rem;color:#5a5e72;font-family:monospace;margin:3px 0">{idc['account_id']}</div>
+                            letter-spacing:0.08em;margin-bottom:4px">{idc.get('region','N/A')}</div>
+                <div style="font-size:1rem;font-weight:500;color:#e8eaf0">{idc.get('account_name','N/A')}</div>
+                <div style="font-size:0.72rem;color:#5a5e72;font-family:monospace;margin:3px 0">{idc.get('account_id','N/A')}</div>
                 <div style="font-size:0.75rem;color:{'#e05252' if error else texto};margin-top:6px">
                     {'❌ Error de conexión' if error else '✅ Conectado'}
                 </div>
@@ -624,15 +1329,15 @@ elif seccion == "🌍 Multi-cuenta":
     for comp, key in zip(componentes, keys):
         fila = {"Componente": comp}
         for dc in datos_cuentas:
-            nombre_col = dc["identidad"]["account_name"]
+            nombre_col = dc["identidad"].get("account_name", "N/A")
             fila[nombre_col] = dc["resumen"].get(key, 0)
         filas.append(fila)
 
     df_comp = pd.DataFrame(filas)
 
-    # Detectar diferencias entre cuentas (réplica)
+    # Detectar diferencias entre cuentas
     if len(datos_cuentas) >= 2:
-        nombres = [dc["identidad"]["account_name"] for dc in datos_cuentas]
+        nombres = [dc["identidad"].get("account_name", "N/A") for dc in datos_cuentas]
         col_a, col_b = nombres[0], nombres[1]
         df_comp["Diferencia"] = df_comp.apply(
             lambda r: "✅ Igual" if r.get(col_a, 0) == r.get(col_b, 0)
@@ -649,7 +1354,7 @@ elif seccion == "🌍 Multi-cuenta":
         st.markdown('<p class="seccion-titulo">Comparación gráfica</p>', unsafe_allow_html=True)
         df_graf = df_comp[df_comp.select_dtypes(include="number").sum(axis=1) > 0].copy()
         if not df_graf.empty:
-            nombres_graf = [dc["identidad"]["account_name"] for dc in datos_cuentas]
+            nombres_graf = [dc["identidad"].get("account_name", "N/A") for dc in datos_cuentas]
             df_melt = df_graf.melt(id_vars="Componente", value_vars=nombres_graf,
                                     var_name="Cuenta", value_name="Cantidad")
             fig = px.bar(df_melt[df_melt["Cantidad"] > 0],
@@ -676,7 +1381,7 @@ elif seccion == "🌍 Multi-cuenta":
                     </span>
                 </div>""", unsafe_allow_html=True)
         else:
-            st.success("✅ Ambas cuentas tienen la misma cantidad de componentes.")
+            st.success("✅ Todas las cuentas tienen la misma cantidad de componentes.")
 
     st.markdown("")
     st.info("Para agregar más cuentas: crea el perfil con 'aws configure --profile nombre' y agrégalo a PERFILES_MULTI en esta sección.")
