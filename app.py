@@ -55,6 +55,94 @@ def get_identity_perfil_cached(perfil):
     """Versión cacheada SIN mostrar 'Running...'"""
     return get_identity_perfil(perfil)
 
+# ─── FUNCIÓN PARA EXPORTAR TODO ───────────────────────────────────────────────
+@st.cache_data(ttl=3600)
+def obtener_inventario_completo():
+    """Recopila TODA la información de todas las cuentas y regiones"""
+    try:
+        datos = []
+        PERFILES = ["afex-des", "afex-prod", "afex-peru", "afex-digital"]
+        
+        for perfil in PERFILES:
+            try:
+                # Obtener nombre de cuenta
+                cuenta_info = get_identity_perfil_cached(perfil)
+                nombre_cuenta = cuenta_info.get('account_name', perfil) if cuenta_info else perfil
+                
+                # EC2
+                try:
+                    ec2_df = get_ec2_perfil(perfil)
+                    if ec2_df is not None and not ec2_df.empty:
+                        for _, row in ec2_df.iterrows():
+                            datos.append({
+                                'Tipo': 'EC2',
+                                'Nombre': str(row.get('nombre', '—')),
+                                'Cuenta': nombre_cuenta,
+                                'Región': str(row.get('region', '—'))
+                            })
+                except: pass
+                
+                # Lambda
+                try:
+                    lambda_df = get_lambda_perfil(perfil)
+                    if lambda_df is not None and not lambda_df.empty:
+                        for _, row in lambda_df.iterrows():
+                            datos.append({
+                                'Tipo': 'Lambda',
+                                'Nombre': str(row.get('nombre', '—')),
+                                'Cuenta': nombre_cuenta,
+                                'Región': str(row.get('region', '—'))
+                            })
+                except: pass
+                
+                # RDS
+                try:
+                    rds_df = get_rds_perfil(perfil)
+                    if rds_df is not None and not rds_df.empty:
+                        for _, row in rds_df.iterrows():
+                            datos.append({
+                                'Tipo': 'RDS',
+                                'Nombre': str(row.get('nombre', '—')),
+                                'Cuenta': nombre_cuenta,
+                                'Región': str(row.get('region', '—'))
+                            })
+                except: pass
+                
+                # S3
+                try:
+                    s3_df = get_s3_perfil(perfil)
+                    if s3_df is not None and not s3_df.empty:
+                        for _, row in s3_df.iterrows():
+                            datos.append({
+                                'Tipo': 'S3',
+                                'Nombre': str(row.get('nombre', '—')),
+                                'Cuenta': nombre_cuenta,
+                                'Región': str(row.get('region', '—'))
+                            })
+                except: pass
+                
+                # VPC
+                try:
+                    vpc_df = get_vpc_perfil(perfil)
+                    if vpc_df is not None and not vpc_df.empty:
+                        for _, row in vpc_df.iterrows():
+                            datos.append({
+                                'Tipo': 'VPC',
+                                'Nombre': str(row.get('nombre', '—')),
+                                'Cuenta': nombre_cuenta,
+                                'Región': str(row.get('region', '—'))
+                            })
+                except: pass
+                
+            except Exception as e:
+                pass
+        
+        if datos:
+            return pd.DataFrame(datos)
+        return pd.DataFrame()
+    except:
+        return pd.DataFrame()
+
 # ─── Configuración de la página ───────────────────────────────────────────────
 st.set_page_config(
     page_title="Inventario AWS",
@@ -185,8 +273,10 @@ def mostrar_cache_status():
     
     # Detalles por servicio
     if metadata:
-        st.markdown('<p class="seccion-titulo">Detalles por servicio</p>', unsafe_allow_html=True)
+        st.markdown('<p class="seccion-titulo">📊 Detalles por servicio</p>', unsafe_allow_html=True)
         
+        # Crear DataFrame con los datos
+        detalles = []
         for key, info in metadata.items():
             ts = info.get('timestamp', '—')
             size = info.get('size_bytes', 0)
@@ -196,19 +286,23 @@ def mostrar_cache_status():
             try:
                 last_update = datetime.fromisoformat(ts)
                 is_fresh = (datetime.now() - last_update) < timedelta(days=1)
-                status_class = "cache-fresh" if is_fresh else "cache-stale"
-                status_text = "✅ Fresco" if is_fresh else "⏱️ Antiguo"
+                status = "✅ Fresco" if is_fresh else "⏱️ Antiguo"
             except:
-                status_class = "cache-error"
-                status_text = "❌ Error"
+                status = "❌ Error"
             
-            st.markdown(f"""
-            <div class="cache-box">
-                <div class="cache-box-item"><strong>{key}:</strong> <span class="{status_class}">{status_text}</span></div>
-                <div class="cache-box-item">Actualizado: {ts.split('T')[0] if 'T' in ts else ts}</div>
-                <div class="cache-box-item">Tamaño: {round(size/1024, 1)} KB</div>
-            </div>
-            """, unsafe_allow_html=True)
+            fecha = ts.split('T')[0] if 'T' in ts else ts
+            
+            detalles.append({
+                'Servicio': key.replace('_df', '').upper(),
+                'Estado': status,
+                'Actualizado': fecha,
+                'Tamaño (KB)': round(size/1024, 1)
+            })
+        
+        df_detalles = pd.DataFrame(detalles)
+        
+        with st.expander("🔄 Cache de servicios", expanded=True):
+            st.dataframe(df_detalles, use_container_width=True, hide_index=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECCIÓN 0 — DASHBOARD
@@ -229,7 +323,23 @@ if seccion == "📊 Dashboard":
             label_visibility="collapsed"
         )
     
-    st.markdown("")
+    with col_vista2:
+        # Botón de exportación (independiente, solo cuando hace click)
+        st.markdown("")
+        st.markdown("")
+        if st.button("📥 Exportar CSV"):
+            with st.spinner("Recopilando datos..."):
+                inventario_df = obtener_inventario_completo()
+                if not inventario_df.empty:
+                    csv = inventario_df.to_csv(index=False)
+                    st.download_button(
+                        label="✅ Descargar CSV",
+                        data=csv,
+                        file_name="inventario_completo.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    st.warning("Sin datos para exportar")
     
     # ─── VISTA 1: TODAS LAS CUENTAS ───
     if vista_seleccionada == "🌍 Todas las cuentas":
