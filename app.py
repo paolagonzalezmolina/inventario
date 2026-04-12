@@ -49,6 +49,12 @@ else:
         st.info("Verifica que corriste: aws configure --profile inventario")
         st.stop()
 
+# ─── CACHE PARA LLAMADAS FRECUENTES ───────────────────────────────────────────
+@st.cache_resource(show_spinner=False)  # Silencioso, sin mostrar "Running..."
+def get_identity_perfil_cached(perfil):
+    """Versión cacheada SIN mostrar 'Running...'"""
+    return get_identity_perfil(perfil)
+
 # ─── Configuración de la página ───────────────────────────────────────────────
 st.set_page_config(
     page_title="Inventario AWS",
@@ -96,6 +102,7 @@ OPCIONES_MENU = [
     "🔌 API Gateway",
     "👥 Usuarios IAM",
     "🗺️ Multi-región",
+    "🔄 Virginia ↔ Ohio",
     "🌍 Multi-cuenta",
 ]
 
@@ -407,7 +414,7 @@ if seccion == "📊 Dashboard":
         st.markdown("")
         
         # Contexto del perfil y región (caché esto también)
-        d   = get_identity_perfil(perfil_activo)
+        d   = get_identity_perfil_cached(perfil_activo)
         nom = d.get("account_name", perfil_activo)
         lbl = f"{nom} ({d['account_id']})" if d.get("account_id","—") != "—" else nom
         usr = d["arn"].split("/")[-1] if "/" in d.get("arn","") else d.get("arn","—")
@@ -555,7 +562,7 @@ elif seccion == "📈 Infraestructura AWS":
         "us-west-2": "us-west-2 Oregon",
         "sa-east-1": "sa-east-1 São Paulo",
     }
-    d   = get_identity_perfil(perfil_activo)
+    d   = get_identity_perfil_cached(perfil_activo)
     nom = d.get("account_name", perfil_activo)
     lbl = f"{nom} ({d['account_id']})" if d.get("account_id","—") != "—" else nom
     usr = d["arn"].split("/")[-1] if "/" in d.get("arn","") else d.get("arn","—")
@@ -677,7 +684,7 @@ elif seccion == "🪣 S3 — Buckets":
         "us-west-2": "us-west-2 Oregon",
         "sa-east-1": "sa-east-1 São Paulo",
     }
-    d   = get_identity_perfil(perfil_activo)
+    d   = get_identity_perfil_cached(perfil_activo)
     nom = d.get("account_name", perfil_activo)
     lbl = f"{nom} ({d['account_id']})" if d.get("account_id","—") != "—" else nom
     usr = d["arn"].split("/")[-1] if "/" in d.get("arn","") else d.get("arn","—")
@@ -695,6 +702,24 @@ elif seccion == "🪣 S3 — Buckets":
             status.update(label="✅ Buckets cargados", state="complete")
             
             if not s3_df.empty:
+                # Agregar columna de privacidad
+                def determinar_privacidad(nombre):
+                    if 'public' in nombre.lower():
+                        return '🔓 Público'
+                    elif 'sandbox' in nombre.lower() or 'test' in nombre.lower():
+                        return '🟡 Semi-público'
+                    else:
+                        return '🔒 Privado'
+                
+                s3_df['privacidad'] = s3_df['nombre'].apply(determinar_privacidad)
+                
+                # Reordenar columnas
+                cols = list(s3_df.columns)
+                if 'privacidad' in cols:
+                    cols.remove('privacidad')
+                    cols.insert(1, 'privacidad')
+                    s3_df = s3_df[cols]
+                
                 st.dataframe(s3_df, use_container_width=True, hide_index=True)
             else:
                 st.info("Sin buckets S3")
@@ -712,7 +737,7 @@ elif seccion == "⚡ Lambda":
     st.markdown("")
     
     # Tabs para dos vistas
-    tab1, tab2 = st.tabs(["📋 Lambda por región", "🔄 Comparación Producción (Virginia ↔ Ohio)"])
+    tab1 = st.tabs(["📋 Lambda por región"])[0]
     
     with tab1:
         st.markdown("")
@@ -743,7 +768,7 @@ elif seccion == "⚡ Lambda":
             "us-west-2": "us-west-2 Oregon",
             "sa-east-1": "sa-east-1 São Paulo",
         }
-        d   = get_identity_perfil(perfil_activo)
+        d   = get_identity_perfil_cached(perfil_activo)
         nom = d.get("account_name", perfil_activo)
         lbl = f"{nom} ({d['account_id']})" if d.get("account_id","—") != "—" else nom
         usr = d["arn"].split("/")[-1] if "/" in d.get("arn","") else d.get("arn","—")
@@ -908,7 +933,7 @@ elif seccion == "🔌 API Gateway":
         "us-west-2": "us-west-2 Oregon",
         "sa-east-1": "sa-east-1 São Paulo",
     }
-    d   = get_identity_perfil(perfil_activo)
+    d   = get_identity_perfil_cached(perfil_activo)
     nom = d.get("account_name", perfil_activo)
     lbl = f"{nom} ({d['account_id']})" if d.get("account_id","—") != "—" else nom
     usr = d["arn"].split("/")[-1] if "/" in d.get("arn","") else d.get("arn","—")
@@ -1102,7 +1127,7 @@ elif seccion == "👥 Usuarios IAM":
         "us-west-2": "us-west-2 Oregon",
         "sa-east-1": "sa-east-1 São Paulo",
     }
-    d   = get_identity_perfil(perfil_activo)
+    d   = get_identity_perfil_cached(perfil_activo)
     nom = d.get("account_name", perfil_activo)
     lbl = f"{nom} ({d['account_id']})" if d.get("account_id","—") != "—" else nom
     usr = d["arn"].split("/")[-1] if "/" in d.get("arn","") else d.get("arn","—")
@@ -1270,6 +1295,181 @@ elif seccion == "🗺️ Multi-región":
         st.info("Para agregar más regiones a una cuenta: edita la lista `regiones` en `PERFILES` dentro de `conector_aws.py`.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SECCIÓN — VIRGINIA ↔ OHIO
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif seccion == "🔄 Virginia ↔ Ohio":
+    st.header("🔄 Virginia ↔ Ohio")
+    st.subheader("Datos lado a lado para análisis manual")
+    
+    st.markdown("""
+    <div class="ctx-box">
+    <strong>Cuenta:</strong> afex-prod (596294895478) · 
+    <strong>Región 1:</strong> us-east-1 Virginia · 
+    <strong>Región 2:</strong> us-east-2 Ohio
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Tabs para API y Lambda
+    tab1, tab2 = st.tabs(["🔌 API REST", "⚡ Lambda"])
+    
+    # ─── TAB 1: API REST ──────────────────────────────────────────────────────
+    with tab1:
+        st.markdown("##### 🔌 APIs REST - Virginia vs Ohio")
+        
+        try:
+            # Obtener datos
+            df_api_va = get_api_df(perfil="afex-prod", region="us-east-1")
+            df_api_oh = get_api_df(perfil="afex-prod", region="us-east-2")
+            
+            if df_api_va is None or df_api_va.empty:
+                df_api_va = pd.DataFrame({'nombre': [], 'recursos': [], 'metodos': [], 'etapas': []})
+            if df_api_oh is None or df_api_oh.empty:
+                df_api_oh = pd.DataFrame({'nombre': [], 'recursos': [], 'metodos': [], 'etapas': []})
+            
+            # Preparar columnas a mostrar
+            cols_mostrar = ['nombre']
+            for col in ['recursos', 'metodos', 'etapas', 'estado']:
+                if col in df_api_va.columns or col in df_api_oh.columns:
+                    cols_mostrar.append(col)
+            
+            # Crear tabla lado a lado
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Virginia (us-east-1)**")
+                df_va_display = df_api_va[cols_mostrar] if len(cols_mostrar) > 0 else df_api_va
+                st.dataframe(df_va_display, use_container_width=True, hide_index=True, height=400)
+            
+            with col2:
+                st.markdown("**Ohio (us-east-2)**")
+                df_oh_display = df_api_oh[cols_mostrar] if len(cols_mostrar) > 0 else df_api_oh
+                st.dataframe(df_oh_display, use_container_width=True, hide_index=True, height=400)
+            
+            # Botones de descarga
+            st.markdown("**Descargar:**")
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                csv_va = df_api_va.to_csv(index=False)
+                st.download_button(
+                    label="📥 Virginia (CSV)",
+                    data=csv_va,
+                    file_name="api_virginia.csv",
+                    mime="text/csv"
+                )
+            
+            with col2:
+                csv_oh = df_api_oh.to_csv(index=False)
+                st.download_button(
+                    label="📥 Ohio (CSV)",
+                    data=csv_oh,
+                    file_name="api_ohio.csv",
+                    mime="text/csv"
+                )
+            
+            with col3:
+                df_api_va['region'] = 'Virginia'
+                df_api_oh['region'] = 'Ohio'
+                df_combined = pd.concat([df_api_va, df_api_oh], ignore_index=True)
+                csv_combined = df_combined.to_csv(index=False)
+                st.download_button(
+                    label="📥 Combinado (CSV)",
+                    data=csv_combined,
+                    file_name="api_combinado.csv",
+                    mime="text/csv"
+                )
+            
+            # Estadísticas
+            st.markdown("**Estadísticas:**")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("APIs Virginia", len(df_api_va))
+            with col2:
+                st.metric("APIs Ohio", len(df_api_oh))
+            with col3:
+                st.metric("Diferencia", abs(len(df_api_va) - len(df_api_oh)))
+        
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+    
+    # ─── TAB 2: LAMBDA ────────────────────────────────────────────────────────
+    with tab2:
+        st.markdown("##### ⚡ Funciones Lambda - Virginia vs Ohio")
+        
+        try:
+            df_lambda_va = get_lambda_df(perfil="afex-prod", region="us-east-1")
+            df_lambda_oh = get_lambda_df(perfil="afex-prod", region="us-east-2")
+            
+            if df_lambda_va is None or df_lambda_va.empty:
+                df_lambda_va = pd.DataFrame()
+            if df_lambda_oh is None or df_lambda_oh.empty:
+                df_lambda_oh = pd.DataFrame()
+            
+            if len(df_lambda_va) > 0 and len(df_lambda_oh) > 0:
+                cols_mostrar = ['nombre', 'runtime', 'memoria', 'timeout']
+                cols_mostrar = [c for c in cols_mostrar if c in df_lambda_va.columns or c in df_lambda_oh.columns]
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("**Virginia (us-east-1)**")
+                    df_va_display = df_lambda_va[cols_mostrar] if len(cols_mostrar) > 0 else df_lambda_va
+                    st.dataframe(df_va_display, use_container_width=True, hide_index=True, height=400)
+                
+                with col2:
+                    st.markdown("**Ohio (us-east-2)**")
+                    df_oh_display = df_lambda_oh[cols_mostrar] if len(cols_mostrar) > 0 else df_lambda_oh
+                    st.dataframe(df_oh_display, use_container_width=True, hide_index=True, height=400)
+                
+                st.markdown("**Descargar:**")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    csv_va = df_lambda_va.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Virginia (CSV)",
+                        data=csv_va,
+                        file_name="lambda_virginia.csv",
+                        mime="text/csv"
+                    )
+                
+                with col2:
+                    csv_oh = df_lambda_oh.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Ohio (CSV)",
+                        data=csv_oh,
+                        file_name="lambda_ohio.csv",
+                        mime="text/csv"
+                    )
+                
+                with col3:
+                    df_lambda_va['region'] = 'Virginia'
+                    df_lambda_oh['region'] = 'Ohio'
+                    df_combined = pd.concat([df_lambda_va, df_lambda_oh], ignore_index=True)
+                    csv_combined = df_combined.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Combinado (CSV)",
+                        data=csv_combined,
+                        file_name="lambda_combinado.csv",
+                        mime="text/csv"
+                    )
+                
+                st.markdown("**Estadísticas:**")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Lambda Virginia", len(df_lambda_va))
+                with col2:
+                    st.metric("Lambda Ohio", len(df_lambda_oh))
+                with col3:
+                    st.metric("Diferencia", abs(len(df_lambda_va) - len(df_lambda_oh)))
+            else:
+                st.info("Sin datos disponibles")
+        
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECCIÓN 5 — MULTI-CUENTA
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1286,7 +1486,7 @@ elif seccion == "🌍 Multi-cuenta":
         datos_cuentas = []
         for perfil in PERFILES_MULTI:
             try:
-                id_cuenta  = get_identity_perfil(perfil)
+                id_cuenta  = get_identity_perfil_cached(perfil)
                 res_cuenta = get_resumen_perfil(perfil)
                 datos_cuentas.append({"identidad": id_cuenta, "resumen": res_cuenta})
             except:
