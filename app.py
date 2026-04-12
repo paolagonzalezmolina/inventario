@@ -740,7 +740,9 @@ elif seccion == "📈 Infraestructura AWS":
     st.markdown('<p class="seccion-titulo">⚡ Funciones Lambda</p>', unsafe_allow_html=True)
     try:
         if not lambda_df.empty:
-            st.dataframe(lambda_df[["nombre","runtime","estado","memoria_mb"]] if "memoria_mb" in lambda_df.columns else lambda_df, use_container_width=True, hide_index=True)
+            # Seleccionar solo columnas que existen
+            cols_mostrar = [c for c in ["nombre","runtime","estado","memoria_mb","timeout_s"] if c in lambda_df.columns]
+            st.dataframe(lambda_df[cols_mostrar] if cols_mostrar else lambda_df, use_container_width=True, hide_index=True)
         else:
             st.info("Sin funciones Lambda en esta región")
     except Exception as e:
