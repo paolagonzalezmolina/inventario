@@ -5,6 +5,7 @@ Inventario AWS multi-cuenta en tiempo real.
 """
 
 import logging
+import re
 
 import pandas as pd
 import plotly.express as px
@@ -31,6 +32,28 @@ st.set_page_config(
 )
 
 GLOBAL_SERVICES = {"s3", "iam_users"}
+ALL_REGIONS_OPTION = "__all_regions__"
+PRIORITY_REGIONS = ["us-east-1", "us-east-2"]
+
+REGION_DISPLAY_NAMES = {
+    "us-east-1": "Virginia",
+    "us-east-2": "Ohio",
+    "us-west-1": "California",
+    "us-west-2": "Oregon",
+    "sa-east-1": "Sao Paulo",
+    "ca-central-1": "Canada",
+    "eu-west-1": "Ireland",
+    "eu-west-2": "London",
+    "eu-west-3": "Paris",
+    "eu-central-1": "Frankfurt",
+    "eu-north-1": "Stockholm",
+    "ap-south-1": "Mumbai",
+    "ap-southeast-1": "Singapore",
+    "ap-southeast-2": "Sydney",
+    "ap-northeast-1": "Tokyo",
+    "ap-northeast-2": "Seoul",
+    "ap-northeast-3": "Osaka",
+}
 
 SERVICE_LABELS = [
     ("ec2", "EC2"),
@@ -64,15 +87,126 @@ RESOURCE_OPTIONS = {
     "SQS (Colas)": "sqs",
 }
 
+REGIONAL_COMPARISON_TARGET = {
+    "account": "afex-prod",
+    "left_region": "us-east-1",
+    "left_label": "PROD / Virginia",
+    "right_region": "us-east-2",
+    "right_label": "CERT / Ohio",
+}
+
+REGIONAL_COMPARISON_SERVICES = [
+    {
+        "key": "ec2",
+        "label": "EC2",
+        "name_columns": ["nombre"],
+        "config_columns": ["tipo", "estado", "vpc", "subnet"],
+    },
+    {
+        "key": "rds",
+        "label": "RDS",
+        "name_columns": ["nombre"],
+        "config_columns": ["motor", "version", "tipo", "estado", "multi_az"],
+    },
+    {
+        "key": "vpc",
+        "label": "VPC",
+        "name_columns": ["nombre"],
+        "config_columns": ["cidr", "estado", "subnets", "default"],
+    },
+    {
+        "key": "vpc_outbound_ips",
+        "label": "NAT/IPs salida",
+        "name_columns": ["name", "resource_id"],
+        "config_columns": ["type", "state", "public_ip", "vpc_id", "subnet_id"],
+    },
+    {
+        "key": "lambda",
+        "label": "Lambda",
+        "name_columns": ["nombre"],
+        "config_columns": ["runtime", "memoria_mb", "timeout_s", "estado"],
+    },
+    {
+        "key": "api_gateway",
+        "label": "API Gateway",
+        "name_columns": ["nombre"],
+        "config_columns": ["tipo", "estado"],
+    },
+    {
+        "key": "cloudformation",
+        "label": "CloudFormation",
+        "name_columns": ["nombre"],
+        "config_columns": ["estado"],
+    },
+    {
+        "key": "ssm",
+        "label": "SSM",
+        "name_columns": ["nombre"],
+        "config_columns": ["tipo", "tier", "version", "data_type"],
+    },
+    {
+        "key": "kms",
+        "label": "KMS",
+        "name_columns": ["alias", "arn", "key_id"],
+        "config_columns": ["estado", "manager", "origen", "es_simetrica"],
+    },
+    {
+        "key": "dynamodb",
+        "label": "DynamoDB",
+        "name_columns": ["nombre"],
+        "config_columns": ["estado", "billing_mode", "lectura", "escritura"],
+    },
+    {
+        "key": "sqs",
+        "label": "SQS",
+        "name_columns": ["nombre"],
+        "config_columns": ["fifo", "kms_key_id"],
+    },
+]
+
 
 def get_account_regions(account_name):
-    """Retorna las regiones configuradas para una cuenta con fallback seguro."""
+    """Retorna las regiones descubiertas para una cuenta con fallback seguro."""
+    discovery = cache_manager.load_discovery() or {}
+    for account in discovery.get("accounts", []):
+        if account.get("name") == account_name:
+            regions = account.get("regions") or []
+            if regions:
+                return regions
     return PERFILES.get(account_name, {}).get("regiones") or ["us-east-1"]
 
 
 def get_global_region(account_name):
     """Retorna la region base donde se guardan servicios globales."""
-    return get_account_regions(account_name)[0]
+    return PERFILES.get(account_name, {}).get("region") or "us-east-1"
+
+
+def get_region_display_label(region_code):
+    """Retorna el codigo de region con un nombre legible."""
+    region_name = REGION_DISPLAY_NAMES.get(region_code)
+    if region_name:
+        return f"{region_code} ({region_name})"
+    return region_code
+
+
+def get_scope_display_label(region_code):
+    """Retorna una etiqueta amigable para el alcance seleccionado."""
+    if region_code == ALL_REGIONS_OPTION:
+        return "Todas las regiones"
+    return get_region_display_label(region_code)
+
+
+def get_prioritized_regions(account_name):
+    """Ordena regiones priorizando Virginia/Ohio y luego el resto alfabeticamente."""
+    regions = list(dict.fromkeys(get_account_regions(account_name)))
+    prioritized = [region for region in PRIORITY_REGIONS if region in regions]
+    remaining = sorted(region for region in regions if region not in prioritized)
+    return prioritized + remaining
+
+
+def get_region_selector_options(account_name):
+    """Retorna opciones del selector con una vista consolidada al inicio."""
+    return [ALL_REGIONS_OPTION] + get_prioritized_regions(account_name)
 
 
 def get_service_region(account_name, selected_region, service_key):
@@ -87,6 +221,347 @@ def load_cached_count(account_name, region, service_key):
     data, is_fresh, exists = cache_manager.get(account_name, region, service_key)
     count = len(data) if exists and isinstance(data, pd.DataFrame) else 0
     return count, is_fresh, exists
+
+
+def load_cached_dataframe(account_name, region, service_key):
+    """Retorna un DataFrame cacheado con metadatos de estado."""
+    data, is_fresh, exists = cache_manager.get(account_name, region, service_key)
+    if exists and isinstance(data, pd.DataFrame):
+        return data.copy(), is_fresh, exists
+    return pd.DataFrame(), is_fresh, exists
+
+
+def summarize_cache_state(states):
+    """Resume el estado de frescura de una coleccion de caches."""
+    existing_states = [is_fresh for is_fresh, exists in states if exists]
+    if not existing_states:
+        return "Sin datos"
+    if all(existing_states):
+        return "Fresco"
+    if any(existing_states):
+        return "Mixto"
+    return "Viejo"
+
+
+def make_dataframe_concat_safe(df):
+    """Normaliza tipos conflictivos para consolidar DataFrames de multiples regiones."""
+    if df is None or df.empty:
+        return df
+
+    safe_df = df.copy()
+    for column in safe_df.columns:
+        series = safe_df[column]
+        try:
+            if getattr(series.dtype, "tz", None) is not None:
+                safe_df[column] = series.astype(str)
+            elif pd.api.types.is_datetime64_any_dtype(series):
+                safe_df[column] = series.astype(str)
+        except Exception:
+            safe_df[column] = series.astype(str)
+
+    return safe_df
+
+
+def load_account_service_dataframe(account_name, service_key, selected_region):
+    """Carga un servicio para una cuenta en una region puntual o consolidado."""
+    if service_key in GLOBAL_SERVICES:
+        global_region = get_global_region(account_name)
+        data, is_fresh, exists = load_cached_dataframe(account_name, global_region, service_key)
+        if exists and not data.empty:
+            data = make_dataframe_concat_safe(data)
+            if "cuenta" not in data.columns:
+                data["cuenta"] = account_name
+            if "region" not in data.columns:
+                data["region"] = global_region
+        return data, summarize_cache_state([(is_fresh, exists)]), exists
+
+    if selected_region != ALL_REGIONS_OPTION:
+        data, is_fresh, exists = load_cached_dataframe(account_name, selected_region, service_key)
+        if exists and not data.empty:
+            data = make_dataframe_concat_safe(data)
+            if "cuenta" not in data.columns:
+                data["cuenta"] = account_name
+            if "region" not in data.columns:
+                data["region"] = selected_region
+        return data, summarize_cache_state([(is_fresh, exists)]), exists
+
+    frames = []
+    states = []
+    for region in get_prioritized_regions(account_name):
+        region_df, is_fresh, exists = load_cached_dataframe(account_name, region, service_key)
+        states.append((is_fresh, exists))
+        if exists and isinstance(region_df, pd.DataFrame) and not region_df.empty:
+            region_df = make_dataframe_concat_safe(region_df)
+            region_df["cuenta"] = account_name
+            region_df["region"] = region
+            frames.append(region_df)
+
+    if not frames:
+        return pd.DataFrame(), summarize_cache_state(states), any(exists for _, exists in states)
+
+    combined = pd.concat(frames, ignore_index=True)
+    return combined, summarize_cache_state(states), True
+
+
+def build_account_region_summary(account_name):
+    """Construye una tabla resumen de conteos por region para una cuenta."""
+    regional_service_columns = [
+        ("ec2", "EC2"),
+        ("rds", "RDS"),
+        ("vpc", "VPC"),
+        ("lambda", "Lambda"),
+        ("api_gateway", "API"),
+        ("ssm", "SSM"),
+        ("kms", "KMS"),
+        ("dynamodb", "DynamoDB"),
+        ("sqs", "SQS"),
+        ("vpc_outbound_ips", "NAT/IPs"),
+        ("cloudformation", "CloudFormation"),
+    ]
+    rows = []
+
+    for region in get_prioritized_regions(account_name):
+        row = {
+            "Cuenta": account_name,
+            "Region": get_region_display_label(region),
+            "Total recursos": 0,
+        }
+        freshness_states = []
+
+        for service_key, label in regional_service_columns:
+            count, is_fresh, exists = load_cached_count(account_name, region, service_key)
+            row[label] = count
+            row["Total recursos"] += count
+            freshness_states.append((is_fresh, exists))
+
+        row["Estado cache"] = summarize_cache_state(freshness_states)
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def build_summary_table_html(df):
+    """Renderiza una tabla HTML con columnas numericas centradas."""
+    if df is None or df.empty:
+        return ""
+
+    left_columns = {"Cuenta", "Region"}
+    html_lines = ['<div class="summary-table-wrapper">', '<table class="summary-table">', "<thead>", "<tr>"]
+
+    for column in df.columns:
+        html_lines.append(f"<th>{column}</th>")
+
+    html_lines.extend(["</tr>", "</thead>", "<tbody>"])
+
+    for _, row in df.iterrows():
+        html_lines.append("<tr>")
+        for column in df.columns:
+            value = row[column]
+            classes = []
+            if column not in left_columns:
+                try:
+                    numeric_value = float(value)
+                    if numeric_value != 0:
+                        classes.append("nonzero-cell")
+                except (TypeError, ValueError):
+                    pass
+
+            class_attr = f' class="{" ".join(classes)}"' if classes else ""
+            html_lines.append(f"<td{class_attr}>{value}</td>")
+        html_lines.append("</tr>")
+
+    html_lines.extend(["</tbody>", "</table>", "</div>"])
+    return "".join(html_lines)
+
+
+def normalize_component_name(value):
+    """Genera una clave base para comparar componentes espejo entre regiones."""
+    if value is None:
+        return ""
+
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return ""
+
+    normalized = normalized.replace("us-east-1", " ").replace("us-east-2", " ")
+    normalized = normalized.replace("virginia", " ").replace("ohio", " ")
+    normalized = re.sub(r"(^|[-_/.\s])(prod|cert)(?=$|[-_/.\s])", " ", normalized)
+    normalized = re.sub(r"[^a-z0-9]+", "_", normalized)
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return normalized
+
+
+def get_first_available_value(row, columns):
+    """Obtiene el primer valor util de una lista de columnas candidatas."""
+    for column in columns:
+        if column not in row.index:
+            continue
+        value = row.get(column)
+        if pd.isna(value):
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {"n/a", "none", "nan"}:
+            return text
+    return ""
+
+
+def build_config_summary(row, columns):
+    """Resume la configuracion principal de un recurso para comparacion rapida."""
+    details = []
+    for column in columns:
+        if column not in row.index:
+            continue
+        value = row.get(column)
+        if pd.isna(value):
+            continue
+        text = str(value).strip()
+        if not text or text.lower() in {"n/a", "none", "nan"}:
+            continue
+        details.append(f"{column}={text}")
+    return " | ".join(details) if details else "Sin detalle principal"
+
+
+def prepare_regional_records(df, service_meta):
+    """Convierte un DataFrame a registros listos para matching entre regiones."""
+    records = {}
+    duplicates = 0
+
+    if df is None or df.empty:
+        return records, duplicates
+
+    name_columns = service_meta.get("name_columns", [])
+    config_columns = service_meta.get("config_columns", [])
+
+    for _, row in df.iterrows():
+        display_name = get_first_available_value(row, name_columns)
+        normalized_name = normalize_component_name(display_name)
+        if normalized_name:
+            comparison_key = normalized_name
+        else:
+            fallback_candidates = [
+                row.get("id"),
+                row.get("resource_id"),
+                row.get("arn"),
+                row.get("url"),
+                row.get("key_id"),
+            ]
+            comparison_key = next(
+                (
+                    str(value).strip().lower()
+                    for value in fallback_candidates
+                    if value is not None and str(value).strip()
+                ),
+                "",
+            )
+
+        if not comparison_key:
+            continue
+
+        if comparison_key in records:
+            duplicates += 1
+            continue
+
+        records[comparison_key] = {
+            "nombre_mostrado": display_name or comparison_key,
+            "config_principal": build_config_summary(row, config_columns),
+        }
+
+    return records, duplicates
+
+
+def compare_regional_service(account_name, left_region, right_region, service_meta):
+    """Compara un servicio entre dos regiones usando solo cache local."""
+    service_key = service_meta["key"]
+    left_df, left_fresh, left_exists = load_cached_dataframe(account_name, left_region, service_key)
+    right_df, right_fresh, right_exists = load_cached_dataframe(account_name, right_region, service_key)
+
+    left_records, left_duplicates = prepare_regional_records(left_df, service_meta)
+    right_records, right_duplicates = prepare_regional_records(right_df, service_meta)
+
+    all_keys = sorted(set(left_records.keys()) | set(right_records.keys()))
+    rows = []
+    only_left = 0
+    only_right = 0
+    shared_equal = 0
+    shared_different = 0
+
+    for key in all_keys:
+        left_record = left_records.get(key)
+        right_record = right_records.get(key)
+
+        if left_record and right_record:
+            same_config = left_record["config_principal"] == right_record["config_principal"]
+            status = "En ambas - coincide" if same_config else "En ambas - config distinta"
+            if same_config:
+                shared_equal += 1
+            else:
+                shared_different += 1
+            display_name = left_record["nombre_mostrado"] or right_record["nombre_mostrado"]
+        elif left_record:
+            status = f"Solo {REGIONAL_COMPARISON_TARGET['left_label']}"
+            only_left += 1
+            display_name = left_record["nombre_mostrado"]
+        else:
+            status = f"Solo {REGIONAL_COMPARISON_TARGET['right_label']}"
+            only_right += 1
+            display_name = right_record["nombre_mostrado"]
+
+        rows.append(
+            {
+                "Componente Base": key,
+                "Nombre Detectado": display_name,
+                "Estado": status,
+                REGIONAL_COMPARISON_TARGET["left_label"]: (
+                    left_record["config_principal"] if left_record else "No existe"
+                ),
+                REGIONAL_COMPARISON_TARGET["right_label"]: (
+                    right_record["config_principal"] if right_record else "No existe"
+                ),
+            }
+        )
+
+    results_df = pd.DataFrame(rows)
+    if not results_df.empty:
+        results_df = results_df.sort_values(
+            by=["Estado", "Nombre Detectado", "Componente Base"],
+            kind="stable",
+        ).reset_index(drop=True)
+
+    return {
+        "service_key": service_key,
+        "label": service_meta["label"],
+        "left_exists": left_exists,
+        "right_exists": right_exists,
+        "left_fresh": left_fresh,
+        "right_fresh": right_fresh,
+        "left_count": len(left_df),
+        "right_count": len(right_df),
+        "only_left": only_left,
+        "only_right": only_right,
+        "shared_equal": shared_equal,
+        "shared_different": shared_different,
+        "left_duplicates": left_duplicates,
+        "right_duplicates": right_duplicates,
+        "results_df": results_df,
+    }
+
+
+def get_global_services_snapshot(account_name):
+    """Resume los servicios globales de la cuenta para mostrarlos aparte."""
+    global_region = get_global_region(account_name)
+    rows = []
+    for service_key, label in [("s3", "S3"), ("iam_users", "IAM Users")]:
+        data, is_fresh, exists = load_cached_dataframe(account_name, global_region, service_key)
+        rows.append(
+            {
+                "Servicio Global": label,
+                "Region base": global_region,
+                "Cantidad": len(data) if exists else 0,
+                "Estado cache": "Fresco" if is_fresh else "Viejo" if exists else "Sin datos",
+                "Nota": "No participa en la comparacion espejo entre regiones",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def sanitize_dataframe_for_display(df):
@@ -140,6 +615,8 @@ def style_plotly_figure(fig, theme_name, chart_kind="default"):
         legend_border = "#cbd5e1"
         paper_bg = "#ffffff"
         plot_bg = "#ffffff"
+        grid_color = "#d1d9e6"
+        axis_line_color = "#7c8aa0"
         template = "plotly_white"
     else:
         font_color = "#e5e7eb"
@@ -147,6 +624,8 @@ def style_plotly_figure(fig, theme_name, chart_kind="default"):
         legend_border = "#475569"
         paper_bg = "#111827"
         plot_bg = "#111827"
+        grid_color = "#334155"
+        axis_line_color = "#94a3b8"
         template = "plotly_dark"
 
     if theme_name == "Claro":
@@ -207,6 +686,22 @@ def style_plotly_figure(fig, theme_name, chart_kind="default"):
         ),
         margin=margin,
         legend=legend_config,
+        xaxis=dict(
+            title_font=dict(color=font_color),
+            tickfont=dict(color=font_color),
+            gridcolor=grid_color,
+            linecolor=axis_line_color,
+            zerolinecolor=grid_color,
+            showline=True,
+        ),
+        yaxis=dict(
+            title_font=dict(color=font_color),
+            tickfont=dict(color=font_color),
+            gridcolor=grid_color,
+            linecolor=axis_line_color,
+            zerolinecolor=grid_color,
+            showline=True,
+        ),
     )
     return fig
 
@@ -466,6 +961,51 @@ st.markdown(
         overflow-x: auto;
         padding-bottom: 8px;
     }}
+    .summary-table table {{
+        width: 100%;
+        border-collapse: collapse;
+        table-layout: auto;
+        background: {theme["panel_bg"]};
+        border: 1px solid {theme["border"]};
+        border-radius: 18px;
+        overflow: hidden;
+    }}
+    .summary-table th {{
+        text-align: center !important;
+        padding: 14px 16px;
+        white-space: nowrap;
+        background: {theme["table_header"]};
+        color: {theme["text"]};
+        border-bottom: 1px solid {theme["border"]};
+        border-right: 1px solid {theme["border"]};
+    }}
+    .summary-table td {{
+        text-align: center !important;
+        vertical-align: middle;
+        padding: 14px 16px;
+        color: {theme["text"]};
+        border-bottom: 1px solid {theme["border"]};
+        border-right: 1px solid {theme["border"]};
+        white-space: nowrap;
+    }}
+    .summary-table td:first-child,
+    .summary-table th:first-child,
+    .summary-table td:nth-child(2),
+    .summary-table th:nth-child(2) {{
+        text-align: left !important;
+    }}
+    .summary-table td.nonzero-cell {{
+        background: {theme["accent_soft"]};
+        color: {theme["text"]};
+        font-weight: 700;
+        box-shadow: inset 0 0 0 1px {theme["border"]};
+    }}
+    .summary-table-wrapper {{
+        width: 100%;
+        overflow-x: auto;
+        padding-bottom: 8px;
+        border-radius: 18px;
+    }}
     .code-surface {{
         background: {theme["panel_bg"]};
         border: 1px solid {theme["border"]};
@@ -491,15 +1031,23 @@ st.markdown(
 st.sidebar.title("AWS Inventory")
 st.sidebar.divider()
 
-page = st.sidebar.radio("Navegacion", ["Dashboard", "Infraestructura AWS"])
+page = st.sidebar.radio(
+    "Navegacion",
+    ["Dashboard", "Infraestructura AWS", "Comparacion Regional"],
+)
 
 st.sidebar.divider()
 
 account_names = list(PERFILES.keys())
 selected_account = st.sidebar.selectbox("Cuenta AWS", account_names)
-selected_account_regions = get_account_regions(selected_account)
+selected_account_regions = get_region_selector_options(selected_account)
 
-selected_region = st.sidebar.selectbox("Region", selected_account_regions)
+selected_region = st.sidebar.selectbox(
+    "Region",
+    selected_account_regions,
+    format_func=get_scope_display_label,
+)
+selected_region_label = get_scope_display_label(selected_region)
 
 st.sidebar.divider()
 st.sidebar.subheader("Descargas")
@@ -556,27 +1104,46 @@ if page == "Dashboard":
     tab1, tab2 = st.tabs(["Cuenta Actual", "Todas las Cuentas"])
 
     with tab1:
-        st.subheader(f"Cuenta: {selected_account} | Region: {selected_region}")
+        st.subheader(f"Cuenta: {selected_account} | Vista: {selected_region_label}")
+        if selected_region == ALL_REGIONS_OPTION:
+            st.caption("Resumen consolidado de todas las regiones descubiertas y cacheadas para la cuenta.")
 
         metrics_data = {}
         for service_key, display_name in SERVICE_LABELS:
-            service_region = get_service_region(
+            service_df, status, exists = load_account_service_dataframe(
                 selected_account,
+                service_key,
                 selected_region,
-                service_key,
             )
-            count, is_fresh, exists = load_cached_count(
-                selected_account,
-                service_region,
-                service_key,
-            )
-            status = "Fresco" if is_fresh else "Viejo" if exists else "Sin datos"
+            count = len(service_df) if exists and isinstance(service_df, pd.DataFrame) else 0
             metrics_data[display_name] = (count, status)
 
         cols = st.columns(4)
         for idx, (display_name, (count, status)) in enumerate(metrics_data.items()):
             with cols[idx % 4]:
                 st.metric(display_name, count, delta=status)
+
+        if selected_region == ALL_REGIONS_OPTION:
+            region_summary_df = build_account_region_summary(selected_account)
+            if not region_summary_df.empty:
+                st.subheader("Cobertura por Region")
+                display_region_summary_df = sanitize_dataframe_for_display(region_summary_df)
+                st.markdown(
+                    build_summary_table_html(display_region_summary_df),
+                    unsafe_allow_html=True,
+                )
+
+                chart_df = display_region_summary_df[["Region", "Total recursos"]]
+                fig = px.bar(
+                    chart_df,
+                    x="Region",
+                    y="Total recursos",
+                    title="Total de Recursos por Region",
+                    labels={"Region": "Region", "Total recursos": "Recursos"},
+                    color="Total recursos",
+                )
+                fig = style_plotly_figure(fig, theme_name)
+                st.plotly_chart(fig, use_container_width=True)
 
     with tab2:
         st.subheader("Resumen Global")
@@ -631,7 +1198,7 @@ if page == "Dashboard":
                 ("sqs", "SQS"),
             ]
 
-            for region in get_account_regions(account):
+            for region in get_prioritized_regions(account):
                 for svc, key in regional_services:
                     data, _, exists = cache_manager.get(account, region, svc)
                     if exists and isinstance(data, pd.DataFrame):
@@ -747,14 +1314,12 @@ if page == "Dashboard":
             except Exception as exc:
                 st.error(f"Error generando Excel: {exc}")
 
-else:
+elif page == "Infraestructura AWS":
     st.title("Infraestructura AWS")
 
     resource_type = st.selectbox("Tipo de Recurso", list(RESOURCE_OPTIONS.keys()))
     cache_key = RESOURCE_OPTIONS[resource_type]
-    use_region = get_service_region(selected_account, selected_region, cache_key)
-
-    data, is_fresh, exists = cache_manager.get(selected_account, use_region, cache_key)
+    data, freshness, exists = load_account_service_dataframe(selected_account, cache_key, selected_region)
 
     try:
         if not exists:
@@ -766,14 +1331,17 @@ else:
         elif len(data) == 0:
             st.warning(f"La busqueda no retorno resultados para {resource_type}.")
         else:
-            freshness = "Fresco" if is_fresh else "Viejo"
+            scope_text = f"{selected_account} | {selected_region_label}"
             st.markdown(
-                build_resource_summary_card(resource_type, len(data), freshness),
+                build_resource_summary_card(resource_type, len(data), f"{freshness} | {scope_text}"),
                 unsafe_allow_html=True,
             )
 
             st.subheader("Datos")
             display_data = sanitize_dataframe_for_display(data)
+            if "region" in display_data.columns:
+                display_data["region"] = display_data["region"].map(get_region_display_label)
+
             styled_display_data = (
                 display_data.style
                 .set_properties(
@@ -803,6 +1371,21 @@ else:
                 )
             )
             st.dataframe(styled_display_data, use_container_width=True)
+
+            if selected_region == ALL_REGIONS_OPTION and "region" in display_data.columns:
+                st.subheader("Distribucion por Region")
+                region_counts = display_data["region"].value_counts().reset_index()
+                region_counts.columns = ["Region", "Cantidad"]
+                fig = px.bar(
+                    region_counts,
+                    x="Region",
+                    y="Cantidad",
+                    title=f"{resource_type} por Region",
+                    labels={"Cantidad": "Cantidad", "Region": "Region"},
+                    color="Cantidad",
+                )
+                fig = style_plotly_figure(fig, theme_name)
+                st.plotly_chart(fig, use_container_width=True)
 
             if cache_key == "ec2" and "estado" in display_data.columns:
                 st.subheader("Estado de Instancias")
@@ -871,3 +1454,136 @@ else:
 
     except Exception as exc:
         st.error(f"Error procesando datos: {str(exc)}")
+
+else:
+    target_account = REGIONAL_COMPARISON_TARGET["account"]
+    left_region = REGIONAL_COMPARISON_TARGET["left_region"]
+    right_region = REGIONAL_COMPARISON_TARGET["right_region"]
+    left_label = REGIONAL_COMPARISON_TARGET["left_label"]
+    right_label = REGIONAL_COMPARISON_TARGET["right_label"]
+
+    st.title("Comparacion Regional")
+    st.caption(
+        "Vista inicial de espejo/DR basada en cache local para afex-prod entre Virginia y Ohio."
+    )
+
+    st.markdown(
+        build_resource_summary_card(
+            "Par analizado",
+            "afex-prod",
+            f"{left_label} ({left_region}) vs {right_label} ({right_region})",
+        ),
+        unsafe_allow_html=True,
+    )
+
+    comparison_results = [
+        compare_regional_service(target_account, left_region, right_region, service_meta)
+        for service_meta in REGIONAL_COMPARISON_SERVICES
+    ]
+
+    total_only_left = sum(result["only_left"] for result in comparison_results)
+    total_only_right = sum(result["only_right"] for result in comparison_results)
+    total_shared_equal = sum(result["shared_equal"] for result in comparison_results)
+    total_shared_different = sum(result["shared_different"] for result in comparison_results)
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Solo Virginia", total_only_left)
+    with col2:
+        st.metric("Solo Ohio", total_only_right)
+    with col3:
+        st.metric("En ambas", total_shared_equal + total_shared_different)
+    with col4:
+        st.metric("Config distinta", total_shared_different)
+
+    st.subheader("Servicios Regionales")
+    st.caption(
+        "El matching usa el nombre base del componente y elimina marcadores como prod/cert, Virginia/Ohio y us-east-1/us-east-2."
+    )
+
+    for result in comparison_results:
+        cache_note = (
+            f"{left_label}: {'Fresco' if result['left_fresh'] else 'Viejo' if result['left_exists'] else 'Sin datos'}"
+            f" | {right_label}: {'Fresco' if result['right_fresh'] else 'Viejo' if result['right_exists'] else 'Sin datos'}"
+        )
+        expander_title = (
+            f"{result['label']} | "
+            f"solo {left_label}: {result['only_left']} | "
+            f"solo {right_label}: {result['only_right']} | "
+            f"ambas: {result['shared_equal'] + result['shared_different']}"
+        )
+
+        with st.expander(expander_title, expanded=False):
+            st.caption(cache_note)
+
+            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+            with metric_col1:
+                st.metric(left_label, result["left_count"])
+            with metric_col2:
+                st.metric(right_label, result["right_count"])
+            with metric_col3:
+                st.metric("Coinciden", result["shared_equal"])
+            with metric_col4:
+                st.metric("Config distinta", result["shared_different"])
+
+            if result["left_duplicates"] or result["right_duplicates"]:
+                st.warning(
+                    "Se detectaron claves repetidas al normalizar nombres. "
+                    f"{left_label}: {result['left_duplicates']} | "
+                    f"{right_label}: {result['right_duplicates']}"
+                )
+
+            if not result["left_exists"] and not result["right_exists"]:
+                st.info("No hay cache disponible para este servicio en ninguna de las dos regiones.")
+                continue
+
+            results_df = result["results_df"]
+            if results_df.empty:
+                st.success("No se detectaron diferencias ni componentes comparables para este servicio.")
+                continue
+
+            display_df = sanitize_dataframe_for_display(results_df)
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Resumen Visual")
+    chart_rows = []
+    for result in comparison_results:
+        chart_rows.extend(
+            [
+                {"Servicio": result["label"], "Estado": f"Solo {left_label}", "Cantidad": result["only_left"]},
+                {"Servicio": result["label"], "Estado": f"Solo {right_label}", "Cantidad": result["only_right"]},
+                {
+                    "Servicio": result["label"],
+                    "Estado": "En ambas",
+                    "Cantidad": result["shared_equal"] + result["shared_different"],
+                },
+            ]
+        )
+
+    chart_df = pd.DataFrame(chart_rows)
+    if not chart_df.empty and chart_df["Cantidad"].sum() > 0:
+        fig = px.bar(
+            chart_df,
+            x="Servicio",
+            y="Cantidad",
+            color="Estado",
+            barmode="stack",
+            title="Comparacion de Componentes por Servicio",
+            labels={"Cantidad": "Cantidad de componentes", "Servicio": "Servicio"},
+            color_discrete_map={
+                f"Solo {left_label}": "#0f766e",
+                f"Solo {right_label}": "#dc2626",
+                "En ambas": "#2563eb",
+            },
+        )
+        fig = style_plotly_figure(fig, theme_name)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Aun no hay suficientes datos cacheados para construir el grafico comparativo.")
+
+    st.subheader("Componentes Globales")
+    st.caption(
+        "Estos servicios pertenecen a la cuenta y se muestran aparte para no mezclarlos con la logica espejo regional."
+    )
+    global_services_df = get_global_services_snapshot(target_account)
+    st.dataframe(sanitize_dataframe_for_display(global_services_df), use_container_width=True, hide_index=True)
