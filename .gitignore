@@ -1,1 +1,27 @@
+# Local AWS credentials and secrets
 key.txt
+.env
+.env.*
+*.env
+*.credentials
+secrets.*
+credentials
+.aws/
+
+# Python environments and caches
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+
+# Tooling and local workspace artifacts
+.claude/
+.pytest_cache/
+.mypy_cache/
+
+# Local generated/cache files
+*.pkl
+*.pickle
+*.xlsx

@@ -1,436 +1,473 @@
-# 📊 Resumen de tu Aplicación - Dashboard AWS Multi-Cuenta
+# 📊 AWS Inventory - Documentación Completa
 
-Has construido un **Dashboard de Inventario AWS multi-cuenta con Streamlit** que es bastante robusto y optimizado. Aquí está la arquitectura completa:
+**Aplicación Streamlit para inventario AWS multi-cuenta en tiempo real.**
 
 ---
 
-## 🏗️ Arquitectura General
+## 📋 Tabla de Contenidos
 
+1. [Descripción General](#descripción-general)
+2. [Requisitos](#requisitos)
+3. [Instalación](#instalación)
+4. [Arquitectura](#arquitectura)
+5. [Funcionalidades](#funcionalidades)
+6. [Uso](#uso)
+7. [Estructura de Archivos](#estructura-de-archivos)
+8. [Estado Actual](#estado-actual)
+9. [Solución de Problemas](#solución-de-problemas)
+
+---
+
+## Descripción General
+
+### ¿Qué hace?
+Herramienta de inventario para AWS que descarga en tiempo real:
+- **Recursos por región:** EC2, RDS, VPC, Lambda, API Gateway
+- **Recursos globales:** S3, IAM Users, CloudFront, Cognito
+- **Multi-cuenta:** Gestiona 4 cuentas AWS simultáneamente
+- **Caché inteligente:** No redescarga si está fresco (TTL 7 días)
+- **Descarga paralela:** ThreadPoolExecutor de 4-8 threads
+
+### Tecnología
 ```
-                          DATA SOURCES
-        ┌────────────────────┬────────────────────┬─────────────────┐
-        │                    │                    │                 │
-    Demo Data         AWS boto3 Connector    HTML Flows
-   datos_ejemplo.py    conector_aws.py    flujos_interactivos.py
-        │                    │                    │
-        └────────────────────┼────────────────────┘
-                             │
-                   ┌─────────┴─────────┐
-                   │                   │
-           STREAMLIT APP (app.py)      │
-           ├─ Sidebar (Menú)           │
-           ├─ Sessions                 │
-           ├─ Caching Local            │
-           ├─ Styling CSS              │
-           └─ 7 Secciones UI           │
-                   │                   │
-        ┌──────────┴──────────┐        │
-        │                     │        │
-   COMPONENTES UI        VISUALIZACIONES
-   ├─ Metrics             ├─ Tables
-   ├─ Tables              ├─ Charts
-   └─ Status Indicators   └─ Metrics
-        │
-        └─────────────────────┘
-                 │
-         7 SECCIONES UI
-    ┌────────┬────────┬────────┬────────┬────────┬────────┬────────┐
-    │        │        │        │        │        │        │        │
-  Dashboard Infra   S3    ⚡Lambda 🔌API  👥IAM  Multi  Multi
-            AWS    Buckets Funcs  Gateway Users  Región Cuenta
+Frontend: Streamlit (Python)
+Backend: AWS boto3 (EC2, RDS, S3, IAM, etc.)
+Caché: pickle en ~/.cache/aws_inventory/
+Export: Excel con openpyxl
 ```
 
 ---
 
-## 📋 Secciones de la Aplicación (7 total)
+## Requisitos
 
-### **1️⃣ 📊 Dashboard**
-**Resumen ejecutivo de toda la infraestructura**
+### Sistema
+- Python 3.9+
+- Windows/Mac/Linux
+- Credenciales AWS configuradas (boto3)
 
-- **Vista "Todas las cuentas":**
-  - Resumen global de 4 cuentas AWS
-  - Totales agregados (EC2, RDS, Lambda, VPC, S3)
-  - Desglose por cuenta
-  - Comparación entre cuentas (gráficos)
-  - Alertas activas
-  - Estado del caché local
-
-- **Vista "Cuenta actual":**
-  - Selector de Cuenta/Región
-  - Contexto (Cuenta · Región · Usuario)
-  - Resumen de infraestructura
-  - Alertas activas
-  - Estado del caché
-
-**Caché:** ⚡ Instantáneo (local)
-
----
-
-### **2️⃣ 📈 Infraestructura AWS**
-**EC2, RDS, Lambda, VPC detallados**
-
-- Selector estático de Cuenta/Región
-- Dropdown para seleccionar tipo de recurso (EC2, RDS, Lambda, VPC)
-- Tabla con:
-  - Nombre del recurso
-  - Tipo/Estado
-  - Configuración (memoria, vCPU, etc)
-  - Última actualización
-  - Estado
-
-**Caché:** Primera carga ~5-8s, luego ⚡ <100ms
-
----
-
-### **3️⃣ 🪣 S3 — Buckets**
-**Listado de buckets S3**
-
-- Selector estático de Cuenta
-- Indicador visual de carga (spinner)
-- Tabla con:
-  - Nombre del bucket
-  - Región
-  - Creación
-  - Tamaño
-  - Objetos
-  - Estado
-
-**Caché:** Persistente local + Streamlit cache
-
----
-
-### **4️⃣ ⚡ Lambda** (NUEVO)
-**Funciones Lambda y replicación entre regiones**
-
-- **Tab 1: "📋 Lambda por región"**
-  - Selector de Cuenta/Región
-  - Métricas: Total, CERT, PROD, Sin Label
-  - Tabla con:
-    - Nombre Lambda
-    - Etiqueta (🟢 CERT / 🔵 PROD / ⚪ SIN LABEL)
-    - Versión, Runtime, Memoria, Timeout
-    - Rol, Handler, Última actualización
-  
-- **Tab 2: "🔄 Comparación Producción (Virginia ↔ Ohio)"**
-  - Análisis exclusivo `afex-prod`
-  - Compara us-east-1 vs us-east-2
-  - Filtra solo CERT o PROD
-  - Muestra:
-    - Total en Virginia vs Ohio
-    - % Replicación
-    - Diferencias detectadas
-  - Alertas automáticas de sincronización
-
-**Caché:** Primera carga ~5-8s, luego ⚡ <100ms
-
----
-
-### **5️⃣ 🔌 API Gateway** (NUEVO)
-**APIs REST y mapeo con Lambdas**
-
-- **Tab 1: "📋 APIs REST"**
-  - Selector de Cuenta/Región
-  - Métricas: Total APIs, Recursos, Métodos, Etapas
-  - Tabla con:
-    - Nombre API
-    - Recursos
-    - Métodos (GET, POST, PUT, DELETE)
-    - Etapas (dev, prod, test)
-    - Fecha de creación
-    - Estado
-
-- **Tab 2: "🔗 Conexiones API ↔ Lambda"** (NUEVO)
-  - **Tabla 1: API → Lambda**
-    ```
-    API Gateway          | 🔗 Función Lambda
-    ─────────────────────┼──────────────────────
-    prod.accounting.api  | accounting-api-prod-app
-    order-api            | order-handler
-    user-api             | user-getter
-    ```
-  
-  - **Tabla 2: Lambda → API**
-    ```
-    Función Lambda       | 🔗 APIs que la usan
-    ─────────────────────┼────────────────────
-    accounting-api-prod  | prod.accounting.api
-    order-handler        | order-api, admin-api
-    user-getter          | user-api, dashboard-api
-    ```
-  
-  - **Tabla 3: Detalle Completo**
-    ```
-    API Gateway | Función Lambda | Ruta | Método | Tipo Integración
-    ────────────┼────────────────┼──────┼────────┼──────────────────
-    prod.acct   | accounting-app | /    | ANY    | AWS_PROXY
-    prod.acct   | accounting-app | /{x} | ANY    | AWS_PROXY
-    ```
-
-**Caché:** Primera carga ~10-15s, luego ⚡ <100ms
-
----
-
-### **6️⃣ 👥 Usuarios IAM**
-**Identidades y acceso**
-
-- Selector de Cuenta/Región
-- Indicador visual de carga
-- Tabla con:
-  - Usuario IAM
-  - ARN
-  - MFA Status (✅/❌)
-  - Login Profile
-  - Access Keys
-  - Políticas
-  - Grupos
-  - Última actualización
-
-**Caché:** Parallelizado (5 usuarios simultáneamente)
-- Primera carga ~10-15s, luego ⚡ <100ms
-
----
-
-### **7️⃣ 🗺️ Multi-región**
-**Comparación entre regiones**
-
-- Selector de Cuenta
-- Comparación de infraestructura por región
-- Tabla con:
-  - Región
-  - EC2 count
-  - RDS count
-  - Lambda count
-  - VPC count
-  - S3 count
-- Gráfico de comparación
-- Detección de diferencias
-
-**Caché:** Por región, local persistente
-
----
-
-### **8️⃣ 🌍 Multi-cuenta**
-**Comparación entre 4 cuentas AWS**
-
-- Tabla comparativa
-- Gráfico de barras por recurso
-- Métricas:
-  - EC2 Instancias
-  - RDS Databases
-  - Lambda Functions
-  - VPCs
-  - S3 Buckets
-
-**Caché:** Agregado, local persistente
-
----
-
-## ⚙️ Configuración AWS
-
-```python
-PERFILES = {
-    "afex-des":     {"perfil": "inventario",   "region": "us-east-1", ...},
-    "afex-prod":    {"perfil": "inventario-b", "region": "us-east-1", ...},
-    "afex-peru":    {"perfil": "inventario-c", "region": "us-east-1", ...},
-    "afex-digital": {"perfil": "inventario-d", "region": "us-east-1", ...},
-}
+### Dependencias
+```bash
+streamlit==1.28.1       # UI web
+pandas==2.1.3           # DataFrames
+boto3==1.34.45          # AWS SDK
+openpyxl==3.1.5         # Excel export
+plotly==5.18.0          # Gráficos
+python-dateutil==2.8.2  # Manejo de fechas
+pytz==2023.3            # Timezones
 ```
 
 ---
 
-## 💾 Sistema de Caché
+## Instalación
 
-**Estrategia de caché en capas:**
-
-1. **Caché Local Persistente** (`~/.cache/aws_inventory/`)
-   - Archivos `.pkl` + `metadata.json`
-   - TTL: 1 día
-   - Cache-first en todas partes
-
-2. **Streamlit Cache**
-   - `@st.cache_data(ttl=3600)`
-   - Para funciones de identidad
-   - Redundancia
-
-**Patrón en todas las funciones:**
-```python
-def get_X(perfil, region):
-    # 1. Intenta caché local primero
-    cached = cache_manager.get(cache_key)
-    if cached: return cached
-    
-    # 2. Si no, carga de AWS
-    data = aws_call()
-    
-    # 3. Guarda en caché local
-    cache_manager.set(cache_key, data)
-    return data
+### 1️⃣ Clonar/Descargar proyecto
+```bash
+cd ~/Documents/inventario
 ```
 
----
+### 2️⃣ Crear entorno virtual (recomendado)
+```bash
+python -m venv venv
 
-## 📊 Componentes Técnicos
+# Windows
+venv\Scripts\activate
 
-### **Frontend (Streamlit)**
-- ✅ Sidebar con 7 secciones
-- ✅ Session state management
-- ✅ Selectbox estáticos (sin llamadas AWS)
-- ✅ Dataframes interactivos
-- ✅ Métricas y gráficos
-- ✅ Status indicators con spinner
-- ✅ CSS styling personalizado
-
-### **Backend (boto3)**
-- ✅ Soporte multi-cuenta
-- ✅ Soporte multi-región
-- ✅ Manejo de errores
-- ✅ IAM parallelizado (5 workers)
-- ✅ Optimización de llamadas API
-
-### **Caché**
-- ✅ Cache manager local
-- ✅ Persistencia en disco
-- ✅ TTL configurable
-- ✅ Limpieza manual
-
----
-
-## 🚀 Características Principales
-
-### **Velocidad**
-| Acción | Primera Vez | Segunda Vez |
-|--------|------------|------------|
-| Ver región | ~5-15s | ⚡ <100ms |
-| Comparación PROD | ~40s | ⚡ <100ms |
-| Cambiar selector | Instantáneo | Instantáneo |
-
-### **Escalabilidad**
-- ✅ Multi-cuenta (4+)
-- ✅ Multi-región (5+)
-- ✅ Caché automático
-- ✅ Sin bottlenecks
-
-### **Funcionalidades Únicas**
-- ✅ **Lambda:** Detección de replicación prod
-- ✅ **API Gateway:** Mapeo automático con Lambdas
-- ✅ **IAM:** Parallelización inteligente
-- ✅ **S3:** Listado con metadatos
-- ✅ **Multi-cuenta:** Comparativas automáticas
-
----
-
-## 📁 Estructura de Archivos
-
-```
-📦 Inventario AWS
-├── 📄 app.py                    # Main Streamlit app
-├── 📄 conector_aws.py           # AWS boto3 connector (1500+ líneas)
-├── 📄 cache_manager.py          # Local persistent cache
-├── 📄 datos_ejemplo.py          # Demo data
-├── 📄 flujos_interactivos.py    # HTML/SVG flows
-├── 📄 requirements.txt          # Dependencies
-└── 📄 setup.bat                 # Windows installer
+# Mac/Linux
+source venv/bin/activate
 ```
 
----
-
-## 📦 Dependencias
-
-```
-streamlit>=1.28.0
-boto3>=1.26.0
-pandas>=2.0.0
-openpyxl>=3.0.0  # Para Excel export (opcional)
+### 3️⃣ Instalar dependencias
+```bash
+pip install -r requirements.txt
 ```
 
----
+### 4️⃣ Configurar AWS
+Asegúrate de tener perfiles boto3 configurados:
+```bash
+# ~/.aws/credentials
+[inventario]
+aws_access_key_id = ...
+aws_secret_access_key = ...
 
-## 🎯 AWS Components Tracked
-
-```
-✅ EC2          - Instancias
-✅ RDS          - Bases de datos
-✅ Lambda       - Funciones (con replicación)
-✅ VPC          - Redes
-✅ S3           - Buckets
-✅ API Gateway  - APIs REST (con mapeo Lambda)
-✅ IAM          - Usuarios y permisos
-✅ Aurora       - Clusters
-✅ DynamoDB     - Tablas
-+ más...
+[inventario-b]
+aws_access_key_id = ...
+aws_secret_access_key = ...
 ```
 
----
-
-## 🎨 UI/UX Features
-
-- ✅ Sidebar con menú radio
-- ✅ Selectores estáticos (sin latencia)
-- ✅ Tablas con scroll horizontal
-- ✅ Métricas con delta
-- ✅ Status indicators con spinner
-- ✅ Contexto visible (Cuenta · Región · Usuario)
-- ✅ CSS personalizado
-- ✅ Responsive design
-
----
-
-## 📊 Ejemplo de Uso
-
-```powershell
-# Instalar
-Copy-Item app_updated.py app.py -Force
-Copy-Item conector_aws.py conector_aws.py -Force
-
-# Ejecutar
+### 5️⃣ Ejecutar
+```bash
 streamlit run app.py
+```
 
-# Abrir navegador
-# → http://localhost:8501
+Se abrirá en `http://localhost:8501`
 
-# Usar
-1. Selecciona sección en sidebar
-2. Elige Cuenta/Región
-3. Visualiza datos (con caché automático)
-4. Segunda carga: ⚡ Instantáneo
+---
+
+## Arquitectura
+
+### Flujo de Datos
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Streamlit (UI)                           │
+│  - Dashboard (Cuenta Actual / Todas las Cuentas)           │
+│  - Infraestructura AWS (dropdown 14 servicios)             │
+└────────────────┬────────────────────────────────────────────┘
+                 │
+    ┌────────────┴────────────┐
+    │                         │
+    ▼                         ▼
+┌─────────────┐      ┌──────────────────┐
+│  app.py     │      │ download_engine  │
+│  (UI)       │      │ (descarga)       │
+└─────────────┘      └────────┬─────────┘
+                              │
+                    ┌─────────┴─────────┐
+                    │                   │
+                    ▼                   ▼
+              ┌─────────────┐   ┌──────────────┐
+              │conector_aws │   │cache_manager │
+              │(boto3)      │   │(pickle)      │
+              └─────────────┘   └──────────────┘
+                    │                   │
+                    └───────────┬───────┘
+                                ▼
+                        ~/.cache/aws_inventory/
+                        ├── discovery.json
+                        ├── metadata.json
+                        └── by_region_account/
+                            ├── afex-des_us-east-1/
+                            ├── afex-prod_us-east-1/
+                            └── ...
+```
+
+### Módulos
+
+| Archivo | Responsabilidad |
+|---------|-----------------|
+| `app.py` | UI Streamlit (2 páginas, tabs, métricas) |
+| `download_engine.py` | Descarga paralela, orquestación |
+| `conector_aws.py` | Conexión a AWS, 7 servicios |
+| `cache_manager.py` | Persistencia, hash, compare_and_update |
+| `export_to_excel.py` | Generación de Excel |
+| `config.py` | PERFILES de cuentas/regiones |
+| `debug_aws_data.py` | Script diagnóstico |
+
+---
+
+## Funcionalidades
+
+### 📊 Dashboard Global
+
+#### Pestaña: "Cuenta Actual"
+- **Métricas:** 14 servicios en grid 4 columnas
+- **Estado:** ✅ Fresco / ⚠️ Viejo / ❌ Sin datos
+- **Selectores:** Cuenta AWS + Región (sidebar)
+
+#### Pestaña: "Todas las Cuentas"
+- **Tabla comparativa:** EC2, RDS, VPC, S3, Lambda, API, etc.
+- **Métricas globales:** 15 servicios
+- **Gráfico de barras:** Distribución por tipo
+- **Botón Excel:** Descarga inventario completo
+
+### 📈 Infraestructura AWS
+
+**Dropdown con 14 opciones:**
+```
+EC2 (Servidores)
+RDS (Bases de datos)
+VPC (Redes)
+S3 (Buckets) - Global
+IAM Users - Global
+⚡ Lambda (Funciones)
+🔌 API Gateway
+(+ CloudFront, Cognito, etc.)
+```
+
+**Por recurso:**
+- ✅ Tabla con todos los datos
+- ✅ Gráfico específico (ej: EC2 por estado, RDS por motor)
+- ✅ Manejo robusto de NoneType
+
+### ⬇️ Descarga Paralela
+
+- **4-8 threads simultáneos**
+- **Descarga inteligente:** Compara hash, solo sobrescribe si cambió
+- **Velocidad:** ~50s primera vez, ~10-15s sin cambios
+- **Logging detallado:** Ve exactamente qué descarga
+
+**Estados:**
+- ✅ `new` - Primera descarga
+- 📈 `updated` - Datos cambiaron
+- ✅ `unchanged` - Sin cambios, no sobrescribe
+- ⚠️ `partial` - Algunos servicios fallaron
+- ❌ `failed` - Descarga completa falló
+
+### 💾 Caché Inteligente
+
+```
+Estructura:
+~/.cache/aws_inventory/
+├── discovery.json          # Regiones por cuenta
+├── metadata.json           # Índice central
+└── by_region_account/
+    ├── afex-des_us-east-1/
+    │   ├── ec2.pkl         # DataFrame comprimido
+    │   ├── rds.pkl
+    │   ├── ec2_timestamp.json
+    │   └── ...
+    └── afex-prod_us-east-2/
+        ├── s3.pkl         # Global (1 por cuenta)
+        └── ...
+```
+
+**TTL:** 7 días (luego marca como "viejo")
+
+**Hash:** SHA256 basado en:
+- Shape del DataFrame
+- Nombres de columnas
+- Primeras 100 filas
+
+### 📥 Export a Excel
+
+**Genera:**
+- ✅ Pestaña "Resumen" (totales por cuenta)
+- ✅ Pestaña "EC2" (todas las instancias)
+- ✅ Pestaña "RDS" (todas las BD)
+- ✅ Pestaña "VPC" (todas las redes)
+- ✅ Pestaña "S3" (todos los buckets)
+- ✅ Pestaña "IAM Users" (todos los usuarios)
+
+**Características:**
+- Estilos automáticos (colores, bordes)
+- Columnas ajustadas al contenido
+- Sin timezones (compatible con Excel)
+- Nombres de columna ordenados
+
+---
+
+## Uso
+
+### Scenario 1: Descarga Inicial
+
+```
+1. Click: "🔄 Descargar Todo"
+   └─ Esperar 50 segundos
+   └─ Ver: "✅ 8 completadas, 0 fallidas"
+
+2. Verificar:
+   └─ Dashboard → Cuenta Actual → Métricas 
+   └─ Debe mostrar EC2, RDS, VPC, Lambda, etc.
+
+3. Exportar:
+   └─ Dashboard → Todas las Cuentas
+   └─ Click: "📥 Descargar Excel"
+   └─ Abre diálogo, descarga inventario_aws.xlsx
+```
+
+### Scenario 2: Actualización (sin cambios)
+
+```
+1. Click: "🔄 Descargar Todo"
+   └─ Esperar 10-15 segundos
+   └─ Ver: "✅ 8 completadas, 0 fallidas"
+
+2. Nota:
+   └─ Datos en caché NO se sobrescribieron
+   └─ (hash = hash anterior)
+   └─ Métricas dicen "✅ Fresco"
+```
+
+### Scenario 3: Limpiar Caché
+
+```
+1. Click: "🗑️ Limpiar Caché"
+   └─ Esperar a: "✅ Caché limpiado"
+
+2. Click: "🔄 Descargar Todo"
+   └─ Descarga nuevamente todo
+   └─ Como descarga inicial
+```
+
+### Scenario 4: Ver Recurso Específico
+
+```
+1. Cambiar Cuenta/Región (sidebar)
+2. Click: "📈 Infraestructura AWS"
+3. Dropdown: Seleccionar "Lambda (Funciones)"
+4. Ver:
+   └─ Métrica: "⚡ Lambda: 225 ✅ Fresco"
+   └─ Tabla: Todas las funciones Lambda
+   └─ (Gráfico si aplica)
 ```
 
 ---
 
-## ✨ Últimas Mejoras (Sesión Actual)
+## Estructura de Archivos
 
-1. ✅ **Sección Lambda** - Listado y replicación prod
-2. ✅ **Sección API Gateway** - Listado de APIs
-3. ✅ **Mapeo API ↔ Lambda** - Asociaciones automáticas
-4. ✅ **Extracción mejorada** - Nombres Lambda correctos
-5. ✅ **Tablas resumidas** - Tres vistas (API→Lambda, Lambda→API, Detalle)
-6. ✅ **Caché optimizado** - Sin demoras
-
----
-
-## 🎓 Lo que Aprendiste
-
-- Multi-account AWS architecture
-- Streamlit best practices
-- boto3 advanced usage
-- Caching strategies
-- Data aggregation
-- UI/UX optimization
-- Error handling
-- Performance tuning
+```
+~/Documents/inventario/
+├── app.py                    # UI Streamlit principal
+├── download_engine.py        # Descarga paralela
+├── conector_aws.py          # Conexión a AWS
+├── cache_manager.py         # Caché inteligente
+├── config.py                # PERFILES (cuentas/regiones)
+├── export_to_excel.py       # Generador Excel
+├── debug_aws_data.py        # Script diagnóstico
+├── requirements.txt         # Dependencias
+├── resumen_aplicacion.md    # Este archivo
+└── .aws/
+    └── credentials          # Perfiles boto3
+```
 
 ---
 
-## 🚀 Listo para Producción
+## Estado Actual
 
-La aplicación está lista para usar en:
-- ✅ Auditoría de infraestructura
-- ✅ Monitoreo multi-cuenta
-- ✅ Documentación automática
-- ✅ Análisis de dependencias
-- ✅ Comparativas regionales
-- ✅ Inventario de recursos
+### ✅ Completado
+
+- [x] Descarga paralela (ThreadPoolExecutor 4 threads)
+- [x] Caché inteligente con hash SHA256
+- [x] Dashboard con 2 tabs (Cuenta Actual / Todas)
+- [x] 14 servicios AWS (EC2, RDS, VPC, S3, IAM, Lambda, API GW, etc.)
+- [x] Página Infraestructura AWS con dropdown
+- [x] Export a Excel con estilos
+- [x] Eliminación de timezones (Excel compatible)
+- [x] Manejo robusto de NoneType/errores
+- [x] Método clear() en cache_manager
+- [x] Logs detallados
+
+### 📊 Servicios Descargados
+
+| Tipo | Región | Global | Función |
+|------|--------|--------|---------|
+| EC2 | ✅ | - | get_ec2_df |
+| RDS | ✅ | - | get_rds_df |
+| VPC | ✅ | - | get_vpc_df |
+| Lambda | ✅ | - | get_lambda_df |
+| API Gateway | ✅ | - | get_api_gateway_df |
+| S3 | - | ✅ | get_s3_df |
+| IAM Users | - | ✅ | get_iam_users_df |
+
+### 📋 Servicios No Implementados
+
+- CloudFormation (mencionado pero no en conector_aws)
+- SSM, KMS, DynamoDB, SQS (mencionados pero no implementados)
+- CloudFront, Cognito (mencionados pero no implementados)
 
 ---
 
-**¡Dashboard completado y optimizado! 🎉**
+## Solución de Problemas
+
+### ❌ "Discovery incompleto"
+
+**Causa:** Función discovery fallaba por conexión AWS
+
+**Solución:** Removida completamente, usa PERFILES directo
+
+**Status:** ✅ Resuelto en v2
+
+---
+
+### ❌ "KeyError: 'completed'"
+
+**Causa:** Estructura de resultado inconsistente en download_all_parallel
+
+**Solución:** Agregada validación en app.py con .get() y valores por defecto
+
+**Status:** ✅ Resuelto
+
+---
+
+### ❌ "NoneType object has no attribute 'replace'"
+
+**Causa:** Datos corrompidos en caché o None en DataFrame
+
+**Solución:** Validación ultra-robusta en infraestructura AWS
+
+**Status:** ✅ Resuelto
+
+---
+
+### ❌ "Excel does not support timezones"
+
+**Causa:** Columnas datetime con tzinfo=UTC
+
+**Solución:** Función _remove_timezones() mejorada en export_to_excel.py
+
+**Status:** ✅ Resuelto
+
+---
+
+### ❌ "ImportError: cannot import name 'get_cloudformation_df'"
+
+**Causa:** Importé funciones que no existen en conector_aws
+
+**Solución:** Eliminar imports de servicios no implementados
+
+**Status:** ✅ Resuelto
+
+---
+
+## Próximos Pasos (Futuro)
+
+- [ ] Implementar CloudFormation, SSM, KMS, DynamoDB, SQS
+- [ ] Historial de cambios (quién modificó qué cuándo)
+- [ ] APScheduler para sincronización automática (lunes 8am)
+- [ ] Visualización de relaciones EC2↔Lambda
+- [ ] API REST para acceso programático
+- [ ] Alertas por cambios críticos
+- [ ] Búsqueda/filtrado avanzado
+
+---
+
+## Contacto / Notas
+
+**Última actualización:** 21 Abril 2026
+
+**Version:** 2.0 (Simplificada, sin Discovery)
+
+**Estado:** Producción (7 servicios AWS funcionales)
+
+---
+
+## Licencia
+
+Propiedad de [Tu Empresa/Nombre]
+
+---
+
+## Apéndice: Comandos Útiles
+
+### Ver caché
+```bash
+python3 << 'EOF'
+from cache_manager import cache_manager
+data, fresh, exists = cache_manager.get('afex-prod', 'us-east-1', 'ec2')
+print(f"Existe: {exists}")
+print(f"Fresco: {fresh}")
+print(f"Filas: {len(data) if exists else 0}")
+EOF
+```
+
+### Limpiar caché desde terminal
+```bash
+python3 << 'EOF'
+from cache_manager import cache_manager
+cache_manager.clear()
+print("✅ Caché limpiado")
+EOF
+```
+
+### Verificar AWS
+```bash
+python debug_aws_data.py
+```
+
+### Ejecutar en producción
+```bash
+streamlit run app.py --logger.level=warning --client.showErrorDetails=false
+```
+
+---
+
+**¡Listo para usar!** 🚀
