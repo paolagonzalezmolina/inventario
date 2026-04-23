@@ -6,6 +6,7 @@ Inventario AWS multi-cuenta en tiempo real.
 
 import logging
 import re
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -80,6 +81,7 @@ RESOURCE_OPTIONS = {
     "IAM Users": "iam_users",
     "Lambda (Funciones)": "lambda",
     "API Gateway": "api_gateway",
+    "API Gateway -> Lambda": "api_gateway_routes",
     "CloudFormation": "cloudformation",
     "SSM (Parametros)": "ssm",
     "KMS (Claves)": "kms",
@@ -124,13 +126,13 @@ REGIONAL_COMPARISON_SERVICES = [
         "key": "lambda",
         "label": "Lambda",
         "name_columns": ["nombre"],
-        "config_columns": ["runtime", "memoria_mb", "timeout_s", "estado"],
+        "config_columns": ["handler", "runtime", "timeout_s", "vpc", "subnets", "estado"],
     },
     {
         "key": "api_gateway",
         "label": "API Gateway",
         "name_columns": ["nombre"],
-        "config_columns": ["tipo", "estado"],
+        "config_columns": ["tipo", "estado", "rutas", "integraciones_lambda", "lambdas"],
     },
     {
         "key": "cloudformation",
@@ -1052,9 +1054,13 @@ selected_region_label = get_scope_display_label(selected_region)
 st.sidebar.divider()
 st.sidebar.subheader("Descargas")
 
+excel_output_path = Path("aws_inventory.xlsx")
+excel_download_data = None
+excel_download_name = f"{selected_account}_inventario.xlsx"
+
 col1, col2 = st.sidebar.columns(2)
 with col1:
-    if st.button("Descargar Todo", use_container_width=True):
+    if st.button("Descargar cache", use_container_width=True):
         with st.spinner("Descargando en paralelo..."):
             result = download_all_parallel(max_workers=4)
             if result.get("status") == "failed":
@@ -1080,9 +1086,51 @@ with col1:
                     st.code("\n".join(download_errors[:50]), language=None)
 
 with col2:
-    if st.button("Limpiar Cache", use_container_width=True):
-        cache_manager.clear()
-        st.success("Cache limpiado")
+    if st.button("Descarga .xlsx", use_container_width=True):
+        try:
+            generated_path = export_to_excel(
+                cache_manager,
+                [selected_account],
+                PERFILES,
+                str(excel_output_path),
+            )
+            if generated_path and excel_output_path.exists():
+                excel_download_data = excel_output_path.read_bytes()
+                st.success(f"Excel listo para {selected_account}")
+            else:
+                st.error("No se pudo generar el archivo Excel.")
+        except Exception as exc:
+            st.error(f"Error generando Excel: {exc}")
+
+if st.sidebar.button("Descarga .xlsx total", use_container_width=True):
+    try:
+        generated_path = export_to_excel(
+            cache_manager,
+            account_names,
+            PERFILES,
+            str(excel_output_path),
+        )
+        if generated_path and excel_output_path.exists():
+            excel_download_data = excel_output_path.read_bytes()
+            excel_download_name = "inventario_global.xlsx"
+            st.success("Excel global listo para todas las cuentas")
+        else:
+            st.error("No se pudo generar el Excel global.")
+    except Exception as exc:
+        st.error(f"Error generando Excel global: {exc}")
+
+if excel_download_data:
+    st.sidebar.download_button(
+        "Bajar .xlsx",
+        data=excel_download_data,
+        file_name=excel_download_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+if st.sidebar.button("Limpiar Cache", use_container_width=True):
+    cache_manager.clear()
+    st.success("Cache limpiado")
 
 st.sidebar.divider()
 st.sidebar.subheader("Estado del Cache")
@@ -1300,20 +1348,6 @@ if page == "Dashboard":
         fig = style_plotly_figure(fig, theme_name)
         st.plotly_chart(fig, use_container_width=True)
 
-        if st.button("Descargar Excel", use_container_width=True):
-            try:
-                output_file = "aws_inventory.xlsx"
-                export_to_excel(cache_manager, account_names, PERFILES, output_file)
-                with open(output_file, "rb") as file_obj:
-                    st.download_button(
-                        "Descargar archivo",
-                        file_obj,
-                        "aws_inventory.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-            except Exception as exc:
-                st.error(f"Error generando Excel: {exc}")
-
 elif page == "Infraestructura AWS":
     st.title("Infraestructura AWS")
 
@@ -1448,6 +1482,37 @@ elif page == "Infraestructura AWS":
                         values=type_count.values,
                         names=type_count.index,
                         title="NAT Gateway vs Elastic IP vs Internet Gateway",
+                    )
+                    fig = style_plotly_figure(fig, theme_name)
+                    st.plotly_chart(fig, use_container_width=True)
+
+            elif cache_key == "api_gateway_routes":
+                if "lambda_function" in display_data.columns:
+                    lambda_counts = (
+                        display_data["lambda_function"]
+                        .fillna("Sin Lambda")
+                        .replace("", "Sin Lambda")
+                        .value_counts()
+                        .head(15)
+                    )
+                    st.subheader("Top Lambdas conectadas")
+                    fig = px.bar(
+                        x=lambda_counts.index,
+                        y=lambda_counts.values,
+                        title="Rutas por Lambda",
+                        labels={"x": "Lambda", "y": "Cantidad de rutas"},
+                    )
+                    fig = style_plotly_figure(fig, theme_name)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                if "api_nombre" in display_data.columns:
+                    api_counts = display_data["api_nombre"].fillna("Sin API").value_counts().head(15)
+                    st.subheader("Top APIs con integraciones")
+                    fig = px.bar(
+                        x=api_counts.index,
+                        y=api_counts.values,
+                        title="Integraciones por API",
+                        labels={"x": "API", "y": "Cantidad de integraciones"},
                     )
                     fig = style_plotly_figure(fig, theme_name)
                     st.plotly_chart(fig, use_container_width=True)

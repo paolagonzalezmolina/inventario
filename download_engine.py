@@ -364,7 +364,7 @@ def download_region_account(account_name, account_profile, region):
     """
     from conector_aws import (
         get_ec2_df, get_rds_df, get_vpc_df, get_s3_df,
-        get_iam_users_df, get_lambda_df, get_api_gateway_df,
+        get_iam_users_df, get_lambda_df, get_api_gateway_df, get_api_gateway_routes_df,
         get_cloudformation_df, get_ssm_df, get_kms_df,
         get_dynamodb_df, get_sqs_df
     )
@@ -519,6 +519,26 @@ def download_region_account(account_name, account_profile, region):
         except Exception as e:
             result['errors'].append(f"API Gateway: {str(e)}")
             logger.error(f"  ❌ API Gateway error: {e}")
+
+        # API Gateway Routes / Lambda mappings
+        try:
+            logger.info(f"  ↳ API Gateway Routes para {key}...")
+            df_api_routes = get_api_gateway_routes_df(account_profile, region)
+            df_api_routes = _enrich_with_audit(
+                account_profile, region, 'api_gateway_routes', df_api_routes
+            )
+            compare_result = cache_manager.compare_and_update(
+                account_name, region, 'api_gateway_routes', df_api_routes
+            )
+            result['resources']['api_gateway_routes'] = {
+                'count': len(df_api_routes),
+                'status': compare_result['status'],
+                'saved': compare_result['saved']
+            }
+            logger.info(f"  ✅ API Gateway Routes: {compare_result['status']}")
+        except Exception as e:
+            result['errors'].append(f"API Gateway Routes: {str(e)}")
+            logger.error(f"  ❌ API Gateway Routes error: {e}")
 
         # CloudFormation
         try:

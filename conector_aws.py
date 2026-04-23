@@ -30,6 +30,7 @@ AUDIT_CREATE_EVENTS = {
     "iam_users": {"CreateUser"},
     "lambda": {"CreateFunction20150331"},
     "api_gateway": {"CreateRestApi", "ImportRestApi"},
+    "api_gateway_routes": {"CreateRestApi", "ImportRestApi", "CreateApi"},
     "cloudformation": {"CreateStack"},
     "ssm": {"PutParameter"},
     "kms": {"CreateKey"},
@@ -105,6 +106,13 @@ def _get_lookup_values(resource_type, row):
         "iam_users": [row.get("username")],
         "lambda": [row.get("nombre")],
         "api_gateway": [row.get("id"), row.get("nombre")],
+        "api_gateway_routes": [
+            row.get("api_id"),
+            row.get("api_nombre"),
+            row.get("lambda_function"),
+            row.get("route_key"),
+            row.get("ruta"),
+        ],
         "cloudformation": [row.get("id"), row.get("nombre")],
         "ssm": [row.get("nombre")],
         "kms": [row.get("arn"), row.get("key_id"), row.get("alias")],
@@ -137,6 +145,8 @@ def _get_native_audit_values(resource_type, row):
         native_updated = row.get("ultima_modificacion")
     elif resource_type == "api_gateway":
         native_created = row.get("creacion")
+    elif resource_type == "api_gateway_routes":
+        native_created = row.get("creacion_api")
     elif resource_type == "cloudformation":
         native_created = row.get("creacion")
         native_updated = row.get("ultima_actualizacion")
@@ -265,6 +275,226 @@ def _get_client(profile_name, service, region):
     except Exception as exc:
         logger.error(f"Error creando cliente {service} en {region}: {exc}")
         return None
+
+
+def _ensure_list(value):
+    """Normaliza strings/listas a una lista simple."""
+    if value in (None, ""):
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _compact_join(values, separator="; "):
+    """Une valores unicos preservando el orden."""
+    unique_values = []
+    for value in _ensure_list(values):
+        if value in (None, ""):
+            continue
+        value_str = str(value)
+        if value_str not in unique_values:
+            unique_values.append(value_str)
+    return separator.join(unique_values)
+
+
+def _extract_role_name(role_arn):
+    """Retorna el RoleName a partir de un ARN IAM."""
+    if not role_arn:
+        return ""
+    return str(role_arn).rsplit("/", 1)[-1]
+
+
+def _extract_lambda_name_from_arn(lambda_arn):
+    """Retorna el nombre de Lambda desde su ARN."""
+    if not lambda_arn or ":function:" not in str(lambda_arn):
+        return ""
+    suffix = str(lambda_arn).split(":function:", 1)[1]
+    return suffix.split(":", 1)[0]
+
+
+def _extract_lambda_arn_from_integration_uri(uri):
+    """Extrae el ARN Lambda desde la URI de integracion de API Gateway."""
+    if not uri:
+        return ""
+
+    uri_text = str(uri)
+    if ":lambda:path/" in uri_text and "/functions/" in uri_text and "/invocations" in uri_text:
+        return uri_text.split("/functions/", 1)[1].split("/invocations", 1)[0]
+    if ":function:" in uri_text:
+        return uri_text
+    return ""
+
+
+def _build_lambda_inventory(profile_name, region):
+    """Obtiene la lista bruta de funciones Lambda."""
+    client = _get_client(profile_name, "lambda", region)
+    if not client:
+        return []
+
+    paginator = client.get_paginator("list_functions")
+    functions = []
+    for page in paginator.paginate():
+        functions.extend(page.get("Functions", []))
+    return functions
+
+
+def _append_policy_permissions(policy_document, action_values, resource_values, summary_values, source):
+    """Aplana statements Allow para resumir permisos efectivos."""
+    statements = policy_document.get("Statement", []) if isinstance(policy_document, dict) else []
+    for statement in _ensure_list(statements):
+        if not isinstance(statement, dict) or statement.get("Effect") != "Allow":
+            continue
+
+        actions = [str(item) for item in _ensure_list(statement.get("Action")) if item]
+        resources = [str(item) for item in _ensure_list(statement.get("Resource")) if item]
+
+        for action in actions:
+            if action not in action_values:
+                action_values.append(action)
+        for resource in resources:
+            if resource not in resource_values:
+                resource_values.append(resource)
+
+        action_text = ", ".join(actions) if actions else "Sin acciones"
+        resource_text = ", ".join(resources) if resources else "Sin recursos"
+        summary = f"{source}: {action_text} -> {resource_text}"
+        if summary not in summary_values:
+            summary_values.append(summary)
+
+
+def _get_lambda_role_permissions(profile_name, role_arn, permission_cache):
+    """Obtiene permisos del rol de ejecucion asociado a Lambda."""
+    role_name = _extract_role_name(role_arn)
+    if not role_name:
+        return {
+            "lambda_execution_role_name": "",
+            "lambda_access_actions": "",
+            "lambda_access_resources": "",
+            "lambda_access_summary": "",
+        }
+
+    if role_name in permission_cache:
+        return permission_cache[role_name]
+
+    iam_client = _get_client(profile_name, "iam", "us-east-1")
+    action_values = []
+    resource_values = []
+    summary_values = []
+
+    if iam_client:
+        try:
+            inline_paginator = iam_client.get_paginator("list_role_policies")
+            for page in inline_paginator.paginate(RoleName=role_name):
+                for policy_name in page.get("PolicyNames", []):
+                    document = iam_client.get_role_policy(
+                        RoleName=role_name,
+                        PolicyName=policy_name,
+                    ).get("PolicyDocument", {})
+                    _append_policy_permissions(
+                        document,
+                        action_values,
+                        resource_values,
+                        summary_values,
+                        f"inline:{policy_name}",
+                    )
+        except Exception as exc:
+            logger.warning(f"No se pudieron leer politicas inline de {role_name}: {exc}")
+
+        try:
+            attached_paginator = iam_client.get_paginator("list_attached_role_policies")
+            for page in attached_paginator.paginate(RoleName=role_name):
+                for policy in page.get("AttachedPolicies", []):
+                    policy_arn = policy.get("PolicyArn")
+                    policy_meta = iam_client.get_policy(PolicyArn=policy_arn).get("Policy", {})
+                    version_id = policy_meta.get("DefaultVersionId")
+                    if not version_id:
+                        continue
+                    document = iam_client.get_policy_version(
+                        PolicyArn=policy_arn,
+                        VersionId=version_id,
+                    ).get("PolicyVersion", {}).get("Document", {})
+                    _append_policy_permissions(
+                        document,
+                        action_values,
+                        resource_values,
+                        summary_values,
+                        f"attached:{policy.get('PolicyName', policy_arn)}",
+                    )
+        except Exception as exc:
+            logger.warning(f"No se pudieron leer politicas adjuntas de {role_name}: {exc}")
+
+    permission_info = {
+        "lambda_execution_role_name": role_name,
+        "lambda_access_actions": _compact_join(action_values),
+        "lambda_access_resources": _compact_join(resource_values),
+        "lambda_access_summary": _compact_join(summary_values, separator=" | "),
+    }
+    permission_cache[role_name] = permission_info
+    return permission_info
+
+
+def _build_lambda_catalog(profile_name, region):
+    """Construye catalogo enriquecido de Lambdas para reutilizar en varias vistas."""
+    permission_cache = {}
+    rows = []
+    catalog = {}
+
+    for func in _build_lambda_inventory(profile_name, region):
+        vpc_config = func.get("VpcConfig") or {}
+        role_arn = func.get("Role", "")
+        permission_info = _get_lambda_role_permissions(profile_name, role_arn, permission_cache)
+
+        row = {
+            "nombre": func.get("FunctionName"),
+            "arn": func.get("FunctionArn"),
+            "handler": func.get("Handler", "N/A"),
+            "runtime": func.get("Runtime", "N/A"),
+            "memoria_mb": func.get("MemorySize", 0),
+            "timeout_s": func.get("Timeout", 0),
+            "estado": func.get("State", "Active"),
+            "estado_ultima_actualizacion": func.get("LastUpdateStatus", "N/A"),
+            "region": region,
+            "vpc": vpc_config.get("VpcId", ""),
+            "subnets": _compact_join(vpc_config.get("SubnetIds")),
+            "security_groups": _compact_join(vpc_config.get("SecurityGroupIds")),
+            "execution_role_arn": role_arn,
+            "execution_role_name": permission_info.get("lambda_execution_role_name", ""),
+            "access_actions": permission_info.get("lambda_access_actions", ""),
+            "access_resources": permission_info.get("lambda_access_resources", ""),
+            "access_summary": permission_info.get("lambda_access_summary", ""),
+            "creacion": func.get("CreatedDate"),
+            "ultima_modificacion": func.get("LastModified"),
+        }
+        rows.append(row)
+
+        function_name = row.get("nombre")
+        function_arn = row.get("arn")
+        if function_name:
+            catalog[function_name] = row
+        if function_arn:
+            catalog[function_arn] = row
+            arn_parts = function_arn.split(":")
+            if len(arn_parts) >= 7:
+                catalog[":".join(arn_parts[:7])] = row
+
+    return rows, catalog
+
+
+def _paginate_apigateway_v2(client, operation_name, result_key, **kwargs):
+    """Pagina operaciones de API Gateway v2 sin depender de paginators."""
+    items = []
+    next_token = None
+    while True:
+        payload = dict(kwargs)
+        if next_token:
+            payload["NextToken"] = next_token
+        response = getattr(client, operation_name)(**payload)
+        items.extend(response.get(result_key, []))
+        next_token = response.get("NextToken")
+        if not next_token:
+            break
+    return items
 
 
 def get_available_regions(profile_name):
@@ -465,25 +695,7 @@ def get_iam_users_df(perfil):
 def get_lambda_df(perfil, region):
     """Obtiene funciones Lambda."""
     try:
-        client = _get_client(perfil, "lambda", region)
-        if not client:
-            return pd.DataFrame()
-
-        paginator = client.get_paginator("list_functions")
-        rows = []
-        for page in paginator.paginate():
-            for func in page.get("Functions", []):
-                rows.append({
-                    "nombre": func.get("FunctionName"),
-                    "runtime": func.get("Runtime", "N/A"),
-                    "memoria_mb": func.get("MemorySize", 0),
-                    "timeout_s": func.get("Timeout", 0),
-                    "estado": "Active",
-                    "region": region,
-                    "creacion": func.get("CreatedDate"),
-                    "ultima_modificacion": func.get("LastModified"),
-                })
-
+        rows, _ = _build_lambda_catalog(perfil, region)
         df = pd.DataFrame(rows)
         logger.info(f"Lambda: {len(df)} funciones en {region}")
         return df
@@ -493,30 +705,185 @@ def get_lambda_df(perfil, region):
 
 
 def get_api_gateway_df(perfil, region):
-    """Obtiene APIs REST de API Gateway."""
+    """Obtiene APIs de API Gateway con un resumen de integraciones Lambda."""
     try:
-        client = _get_client(perfil, "apigateway", region)
-        if not client:
-            return pd.DataFrame()
+        base_rows = []
 
-        rows = []
-        paginator = client.get_paginator("get_rest_apis")
-        for page in paginator.paginate():
-            for api in page.get("items", []):
-                rows.append({
-                    "id": api.get("id"),
-                    "nombre": api.get("name"),
-                    "tipo": "REST",
+        rest_client = _get_client(perfil, "apigateway", region)
+        if rest_client:
+            paginator = rest_client.get_paginator("get_rest_apis")
+            for page in paginator.paginate():
+                for api in page.get("items", []):
+                    base_rows.append({
+                        "id": api.get("id"),
+                        "nombre": api.get("name"),
+                        "tipo": "REST",
+                        "estado": "ACTIVE",
+                        "region": region,
+                        "creacion": api.get("createdDate"),
+                    })
+
+        v2_client = _get_client(perfil, "apigatewayv2", region)
+        if v2_client:
+            for api in _paginate_apigateway_v2(v2_client, "get_apis", "Items"):
+                base_rows.append({
+                    "id": api.get("ApiId"),
+                    "nombre": api.get("Name"),
+                    "tipo": api.get("ProtocolType", "HTTP"),
                     "estado": "ACTIVE",
                     "region": region,
-                    "creacion": api.get("createdDate"),
+                    "creacion": api.get("CreatedDate"),
                 })
 
-        df = pd.DataFrame(rows)
+        route_df = get_api_gateway_routes_df(perfil, region)
+        if route_df.empty:
+            df = pd.DataFrame(base_rows)
+            logger.info(f"API Gateway: {len(df)} APIs en {region}")
+            return df
+
+        rows = {}
+        for item in base_rows:
+            rows[item["id"]] = dict(item)
+
+        group_columns = ["api_id", "api_nombre", "api_tipo", "api_estado", "region", "creacion_api"]
+        for group_key, api_routes in route_df.groupby(group_columns, dropna=False):
+            api_id, api_name, api_type, api_status, api_region, created_at = group_key
+            lambda_functions = [
+                value for value in api_routes.get("lambda_function", pd.Series(dtype=str)).fillna("").astype(str).unique()
+                if value
+            ]
+            rows[api_id] = {
+                "id": api_id,
+                "nombre": api_name,
+                "tipo": api_type,
+                "estado": api_status,
+                "region": api_region,
+                "creacion": created_at,
+                "rutas": len(api_routes),
+                "integraciones_lambda": int((api_routes.get("lambda_function", pd.Series(dtype=str)).fillna("").astype(str) != "").sum()),
+                "lambdas": _compact_join(lambda_functions),
+            }
+
+        df = pd.DataFrame(rows.values())
         logger.info(f"API Gateway: {len(df)} APIs en {region}")
         return df
     except Exception as exc:
         logger.error(f"Error obteniendo API Gateway para {perfil}/{region}: {exc}")
+        return pd.DataFrame()
+
+
+def get_api_gateway_routes_df(perfil, region):
+    """Obtiene el detalle API -> ruta/metodo -> Lambda -> permisos/VPC."""
+    try:
+        lambda_rows, lambda_catalog = _build_lambda_catalog(perfil, region)
+        del lambda_rows
+
+        rows = []
+
+        rest_client = _get_client(perfil, "apigateway", region)
+        if rest_client:
+            paginator = rest_client.get_paginator("get_rest_apis")
+            for page in paginator.paginate():
+                for api in page.get("items", []):
+                    api_id = api.get("id")
+                    resource_paginator = rest_client.get_paginator("get_resources")
+                    for resource_page in resource_paginator.paginate(restApiId=api_id, embed=["methods"]):
+                        for resource in resource_page.get("items", []):
+                            resource_path = resource.get("path", "/")
+                            for http_method in (resource.get("resourceMethods") or {}).keys():
+                                method_detail = rest_client.get_method(
+                                    restApiId=api_id,
+                                    resourceId=resource.get("id"),
+                                    httpMethod=http_method,
+                                )
+                                integration = method_detail.get("methodIntegration", {}) or {}
+                                lambda_arn = _extract_lambda_arn_from_integration_uri(integration.get("uri", ""))
+                                lambda_name = _extract_lambda_name_from_arn(lambda_arn)
+                                lambda_info = (
+                                    lambda_catalog.get(lambda_arn)
+                                    or lambda_catalog.get(lambda_name)
+                                    or {}
+                                )
+
+                                rows.append({
+                                    "api_id": api_id,
+                                    "api_nombre": api.get("name"),
+                                    "api_tipo": "REST",
+                                    "api_estado": "ACTIVE",
+                                    "region": region,
+                                    "creacion_api": api.get("createdDate"),
+                                    "route_key": f"{http_method} {resource_path}",
+                                    "metodo_http": http_method,
+                                    "ruta": resource_path,
+                                    "integration_type": integration.get("type", "N/A"),
+                                    "integration_uri": integration.get("uri", ""),
+                                    "lambda_function": lambda_info.get("nombre", lambda_name),
+                                    "lambda_arn": lambda_info.get("arn", lambda_arn),
+                                    "lambda_handler": lambda_info.get("handler", ""),
+                                    "lambda_runtime": lambda_info.get("runtime", ""),
+                                    "lambda_vpc": lambda_info.get("vpc", ""),
+                                    "lambda_subnets": lambda_info.get("subnets", ""),
+                                    "lambda_security_groups": lambda_info.get("security_groups", ""),
+                                    "lambda_execution_role": lambda_info.get("execution_role_name", ""),
+                                    "lambda_access_actions": lambda_info.get("access_actions", ""),
+                                    "lambda_access_resources": lambda_info.get("access_resources", ""),
+                                    "lambda_access_summary": lambda_info.get("access_summary", ""),
+                                })
+
+        v2_client = _get_client(perfil, "apigatewayv2", region)
+        if v2_client:
+            apis = _paginate_apigateway_v2(v2_client, "get_apis", "Items")
+            for api in apis:
+                api_id = api.get("ApiId")
+                integrations = _paginate_apigateway_v2(v2_client, "get_integrations", "Items", ApiId=api_id)
+                integration_map = {
+                    item.get("IntegrationId"): item
+                    for item in integrations
+                    if item.get("IntegrationId")
+                }
+                routes = _paginate_apigateway_v2(v2_client, "get_routes", "Items", ApiId=api_id)
+                for route in routes:
+                    target = route.get("Target", "")
+                    integration_id = target.split("/", 1)[1] if target.startswith("integrations/") else ""
+                    integration = integration_map.get(integration_id, {})
+                    lambda_arn = _extract_lambda_arn_from_integration_uri(integration.get("IntegrationUri", ""))
+                    lambda_name = _extract_lambda_name_from_arn(lambda_arn)
+                    lambda_info = (
+                        lambda_catalog.get(lambda_arn)
+                        or lambda_catalog.get(lambda_name)
+                        or {}
+                    )
+
+                    rows.append({
+                        "api_id": api_id,
+                        "api_nombre": api.get("Name"),
+                        "api_tipo": api.get("ProtocolType", "HTTP"),
+                        "api_estado": "ACTIVE",
+                        "region": region,
+                        "creacion_api": api.get("CreatedDate"),
+                        "route_key": route.get("RouteKey", ""),
+                        "metodo_http": route.get("RouteKey", "").split(" ", 1)[0] if " " in str(route.get("RouteKey", "")) else route.get("RouteKey", ""),
+                        "ruta": route.get("RouteKey", "").split(" ", 1)[1] if " " in str(route.get("RouteKey", "")) else route.get("RouteKey", ""),
+                        "integration_type": integration.get("IntegrationType", "N/A"),
+                        "integration_uri": integration.get("IntegrationUri", ""),
+                        "lambda_function": lambda_info.get("nombre", lambda_name),
+                        "lambda_arn": lambda_info.get("arn", lambda_arn),
+                        "lambda_handler": lambda_info.get("handler", ""),
+                        "lambda_runtime": lambda_info.get("runtime", ""),
+                        "lambda_vpc": lambda_info.get("vpc", ""),
+                        "lambda_subnets": lambda_info.get("subnets", ""),
+                        "lambda_security_groups": lambda_info.get("security_groups", ""),
+                        "lambda_execution_role": lambda_info.get("execution_role_name", ""),
+                        "lambda_access_actions": lambda_info.get("access_actions", ""),
+                        "lambda_access_resources": lambda_info.get("access_resources", ""),
+                        "lambda_access_summary": lambda_info.get("access_summary", ""),
+                    })
+
+        df = pd.DataFrame(rows)
+        logger.info(f"API Gateway Routes: {len(df)} integraciones en {region}")
+        return df
+    except Exception as exc:
+        logger.error(f"Error obteniendo integraciones API Gateway para {perfil}/{region}: {exc}")
         return pd.DataFrame()
 
 
