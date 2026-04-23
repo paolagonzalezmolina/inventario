@@ -612,22 +612,22 @@ def build_resource_summary_card(title, value, freshness):
 def style_plotly_figure(fig, theme_name, chart_kind="default"):
     """Aplica una apariencia consistente a figuras Plotly."""
     if theme_name == "Claro":
-        font_color = "#1f2937"
+        font_color = "#163222"
         legend_bg = "rgba(255,255,255,0.98)"
-        legend_border = "#cbd5e1"
+        legend_border = "#bfd4c6"
         paper_bg = "#ffffff"
         plot_bg = "#ffffff"
-        grid_color = "#d1d9e6"
-        axis_line_color = "#7c8aa0"
+        grid_color = "#dbe7df"
+        axis_line_color = "#6e8a78"
         template = "plotly_white"
     else:
-        font_color = "#e5e7eb"
-        legend_bg = "rgba(17,24,39,0.98)"
-        legend_border = "#475569"
-        paper_bg = "#111827"
-        plot_bg = "#111827"
-        grid_color = "#334155"
-        axis_line_color = "#94a3b8"
+        font_color = "#f3f4f6"
+        legend_bg = "rgba(24,24,27,0.98)"
+        legend_border = "#3f3f46"
+        paper_bg = "#18181b"
+        plot_bg = "#18181b"
+        grid_color = "#3f3f46"
+        axis_line_color = "#71717a"
         template = "plotly_dark"
 
     if theme_name == "Claro":
@@ -712,37 +712,55 @@ def get_theme_palette(theme_name):
     """Retorna variables CSS para el tema seleccionado."""
     if theme_name == "Claro":
         return {
-            "app_bg": "#f6f8fb",
+            "app_bg": "#f7faf7",
             "panel_bg": "#ffffff",
-            "sidebar_bg": "#eef3f9",
-            "header_bg": "#f6f8fb",
-            "text": "#1f2937",
-            "muted_text": "#5b6472",
-            "border": "#d7dfeb",
-            "accent": "#0f766e",
-            "accent_soft": "#d9f3ef",
-            "table_header": "#edf2f7",
+            "sidebar_bg": "#0d361e",
+            "header_bg": "#f7faf7",
+            "text": "#163222",
+            "muted_text": "#486150",
+            "border": "#cad8ce",
+            "accent": "#1a4a2e",
+            "accent_soft": "#d9e8de",
+            "table_header": "#edf4ef",
             "button_bg": "#ffffff",
-            "button_text": "#1f2937",
-            "button_border": "#cfd8e3",
-            "hover_bg": "#f3f6fb",
+            "button_text": "#163222",
+            "button_border": "#b9cbbb",
+            "hover_bg": "#e6efe8",
+            "sidebar_text": "#f3f7f3",
+            "sidebar_muted": "#9ab3a1",
+            "sidebar_border": "#225235",
+            "sidebar_panel_bg": "#1d4729",
+            "sidebar_button_bg": "#16b85f",
+            "sidebar_button_text": "#ffffff",
+            "sidebar_metric_bg": "#1a3f25",
+            "sidebar_metric_border": "#2b5b39",
+            "sidebar_success_bg": "#1b5a31",
         }
 
     return {
-        "app_bg": "#0f172a",
-        "panel_bg": "#111827",
-        "sidebar_bg": "#0b1220",
-        "header_bg": "#0b1220",
-        "text": "#e5e7eb",
-        "muted_text": "#9ca3af",
-        "border": "#243041",
-        "accent": "#22c55e",
-        "accent_soft": "#163322",
-        "table_header": "#172131",
-        "button_bg": "#1f2937",
-        "button_text": "#e5e7eb",
-        "button_border": "#334155",
-        "hover_bg": "#273449",
+        "app_bg": "#09090b",
+        "panel_bg": "#18181b",
+        "sidebar_bg": "#111113",
+        "header_bg": "#111113",
+        "text": "#f3f4f6",
+        "muted_text": "#a1a1aa",
+        "border": "#3f3f46",
+        "accent": "#3f8f5a",
+        "accent_soft": "#1f2a23",
+        "table_header": "#232326",
+        "button_bg": "#202024",
+        "button_text": "#f3f4f6",
+        "button_border": "#3f3f46",
+        "hover_bg": "#2a2a2f",
+        "sidebar_text": "#f3f4f6",
+        "sidebar_muted": "#a1a1aa",
+        "sidebar_border": "#2a2a2f",
+        "sidebar_panel_bg": "#202024",
+        "sidebar_button_bg": "#2f2f35",
+        "sidebar_button_text": "#f3f4f6",
+        "sidebar_metric_bg": "#202024",
+        "sidebar_metric_border": "#3f3f46",
+        "sidebar_success_bg": "#1f2a23",
     }
 
 
@@ -780,11 +798,24 @@ st.markdown(
     }}
     [data-testid="stSidebar"] {{
         background: {theme["sidebar_bg"]};
-        border-right: 1px solid {theme["border"]};
+        border-right: 1px solid {theme["sidebar_border"]};
+    }}
+    [data-testid="stSidebar"] * {{
+        color: {theme["sidebar_text"]};
+    }}
+    [data-testid="stSidebar"] small,
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] span {{
+        color: {theme["sidebar_text"]};
+    }}
+    [data-testid="stSidebar"] .stMarkdown,
+    [data-testid="stSidebar"] .stCaption {{
+        color: {theme["sidebar_muted"]};
     }}
     [data-testid="stSidebarCollapseButton"] svg,
     [data-testid="collapsedControl"] svg {{
-        fill: {theme["text"]};
+        fill: {theme["sidebar_text"]};
     }}
     h1, h2, h3, h4, h5, h6, label, p, span {{
         color: {theme["text"]};
@@ -800,6 +831,14 @@ st.markdown(
         border-color: {theme["border"]};
         color: {theme["text"]};
     }}
+    [data-testid="stSidebar"] div[data-baseweb="select"] > div,
+    [data-testid="stSidebar"] div[data-baseweb="input"] > div,
+    [data-testid="stSidebar"] div[data-testid="stSelectbox"] > div > div,
+    [data-testid="stSidebar"] div[data-testid="stTextInput"] > div > div {{
+        background: {theme["sidebar_panel_bg"]};
+        border-color: {theme["sidebar_border"]};
+        color: {theme["sidebar_text"]};
+    }}
     div[data-baseweb="select"] input,
     div[data-baseweb="select"] span,
     div[data-baseweb="select"] svg,
@@ -808,6 +847,15 @@ st.markdown(
     div[data-baseweb="input"] svg {{
         color: {theme["text"]};
         fill: {theme["text"]};
+    }}
+    [data-testid="stSidebar"] div[data-baseweb="select"] input,
+    [data-testid="stSidebar"] div[data-baseweb="select"] span,
+    [data-testid="stSidebar"] div[data-baseweb="select"] svg,
+    [data-testid="stSidebar"] div[data-baseweb="input"] input,
+    [data-testid="stSidebar"] div[data-baseweb="input"] span,
+    [data-testid="stSidebar"] div[data-baseweb="input"] svg {{
+        color: {theme["sidebar_text"]};
+        fill: {theme["sidebar_text"]};
     }}
     div[role="listbox"] {{
         background: {theme["panel_bg"]} !important;
@@ -849,6 +897,18 @@ st.markdown(
     div[data-testid="stMetricDelta"] {{
         justify-content: center;
         color: {theme["accent"]};
+    }}
+    [data-testid="stSidebar"] div[data-testid="stMetric"] {{
+        background: {theme["sidebar_metric_bg"]};
+        border: 1px solid {theme["sidebar_metric_border"]};
+        box-shadow: none;
+    }}
+    [data-testid="stSidebar"] div[data-testid="stMetricLabel"],
+    [data-testid="stSidebar"] div[data-testid="stMetricValue"] {{
+        color: {theme["sidebar_text"]};
+    }}
+    [data-testid="stSidebar"] div[data-testid="stMetricDelta"] {{
+        color: {theme["sidebar_text"]};
     }}
     div[data-testid="stDataFrame"] {{
         background: {theme["panel_bg"]};
@@ -904,7 +964,8 @@ st.markdown(
         color: {theme["muted_text"]};
     }}
     div[data-testid="stTabs"] button[aria-selected="true"] {{
-        color: {theme["text"]};
+        color: {theme["accent"]};
+        border-bottom-color: {theme["accent"]};
     }}
     button[kind="secondary"],
     button[kind="primary"] {{
@@ -923,6 +984,29 @@ st.markdown(
         background: {theme["hover_bg"]};
         color: {theme["button_text"]};
         border-color: {theme["button_border"]};
+    }}
+    [data-testid="stSidebar"] .stButton > button,
+    [data-testid="stSidebar"] [data-testid="baseButton-secondary"],
+    [data-testid="stSidebar"] [data-testid="baseButton-primary"] {{
+        background: {theme["sidebar_button_bg"]};
+        color: {theme["sidebar_button_text"]};
+        border: 1px solid {theme["sidebar_border"]};
+    }}
+    [data-testid="stSidebar"] .stButton > button:hover,
+    [data-testid="stSidebar"] [data-testid="baseButton-secondary"]:hover,
+    [data-testid="stSidebar"] [data-testid="baseButton-primary"]:hover {{
+        background: {theme["accent"]};
+        color: {theme["sidebar_button_text"]};
+        border-color: {theme["accent"]};
+    }}
+    [data-testid="stSidebar"] div[data-testid="stAlert"] {{
+        background: {theme["sidebar_success_bg"]};
+        border: 1px solid {theme["sidebar_metric_border"]};
+        color: {theme["sidebar_text"]};
+        box-shadow: none;
+    }}
+    [data-testid="stSidebar"] div[data-testid="stAlert"] * {{
+        color: {theme["sidebar_text"]} !important;
     }}
     .account-comparison-table table {{
         width: 100%;
@@ -1636,9 +1720,9 @@ else:
             title="Comparacion de Componentes por Servicio",
             labels={"Cantidad": "Cantidad de componentes", "Servicio": "Servicio"},
             color_discrete_map={
-                f"Solo {left_label}": "#0f766e",
-                f"Solo {right_label}": "#dc2626",
-                "En ambas": "#2563eb",
+                f"Solo {left_label}": "#1a4a2e",
+                f"Solo {right_label}": "#b91c1c",
+                "En ambas": "#52525b",
             },
         )
         fig = style_plotly_figure(fig, theme_name)
