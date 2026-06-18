@@ -168,6 +168,7 @@ def _get_vpc_outbound_ips_inline(account_profile, region):
                         'private_ip': '',
                         'allocation_id': '',
                         'network_interface_id': '',
+                        'instance_id': '',
                         'state': nat.get('State'),
                         'connectivity_type': nat.get('ConnectivityType', 'public'),
                         'region': region,
@@ -183,6 +184,7 @@ def _get_vpc_outbound_ips_inline(account_profile, region):
                         'private_ip': addr.get('PrivateIp') or '',
                         'allocation_id': addr.get('AllocationId') or '',
                         'network_interface_id': addr.get('NetworkInterfaceId') or '',
+                        'instance_id': '',
                         'state': nat.get('State'),
                         'connectivity_type': nat.get('ConnectivityType', 'public'),
                         'region': region,
@@ -210,6 +212,7 @@ def _get_vpc_outbound_ips_inline(account_profile, region):
                 'private_ip': addr.get('PrivateIpAddress') or '',
                 'allocation_id': alloc_id,
                 'network_interface_id': addr.get('NetworkInterfaceId') or '',
+                'instance_id': addr.get('InstanceId') or '',
                 'state': 'associated' if addr.get('AssociationId') else 'available',
                 'connectivity_type': 'public',
                 'region': region,
@@ -234,6 +237,7 @@ def _get_vpc_outbound_ips_inline(account_profile, region):
                     'private_ip': '',
                     'allocation_id': '',
                     'network_interface_id': '',
+                    'instance_id': '',
                     'state': 'detached',
                     'connectivity_type': 'public',
                     'region': region,
@@ -249,6 +253,7 @@ def _get_vpc_outbound_ips_inline(account_profile, region):
                     'private_ip': '',
                     'allocation_id': '',
                     'network_interface_id': '',
+                    'instance_id': '',
                     'state': att.get('State', 'unknown'),
                     'connectivity_type': 'public',
                     'region': region,
@@ -286,6 +291,25 @@ def _enrich_with_audit(account_profile, region, resource_type, data):
 # ═════════════════════════════════════════════════════════════════════════════
 # FUNCIONES DE DISCOVERY
 # ═════════════════════════════════════════════════════════════════════════════
+
+def _enrich_with_monitoring_alerts(account_profile, region, resource_type, data):
+    """Completa metadatos de alarmas CloudWatch antes de guardar en cache."""
+    try:
+        from conector_aws import add_monitoring_alerts_metadata  # type: ignore
+        return add_monitoring_alerts_metadata(account_profile, region, resource_type, data)
+    except Exception as e:
+        logger.warning(
+            f"No se pudo enriquecer monitoreo para {resource_type} en {region}: {e}"
+        )
+        return data
+
+
+def _enrich_resource_metadata(account_profile, region, resource_type, data):
+    """Aplica enriquecimientos transversales de auditoria y monitoreo."""
+    data = _enrich_with_audit(account_profile, region, resource_type, data)
+    data = _enrich_with_monitoring_alerts(account_profile, region, resource_type, data)
+    return data
+
 
 def discover_regions_and_accounts():
     """
@@ -389,7 +413,7 @@ def download_region_account(account_name, account_profile, region):
         try:
             logger.info(f"  ↳ EC2 para {key}...")
             df_ec2 = get_ec2_df(account_profile, region)
-            df_ec2 = _enrich_with_audit(account_profile, region, 'ec2', df_ec2)
+            df_ec2 = _enrich_resource_metadata(account_profile, region, 'ec2', df_ec2)
             compare_result = cache_manager.compare_and_update(account_name, region, 'ec2', df_ec2)
             result['resources']['ec2'] = {
                 'count': len(df_ec2),
@@ -405,7 +429,7 @@ def download_region_account(account_name, account_profile, region):
         try:
             logger.info(f"  ↳ RDS para {key}...")
             df_rds = get_rds_df(account_profile, region)
-            df_rds = _enrich_with_audit(account_profile, region, 'rds', df_rds)
+            df_rds = _enrich_resource_metadata(account_profile, region, 'rds', df_rds)
             compare_result = cache_manager.compare_and_update(account_name, region, 'rds', df_rds)
             result['resources']['rds'] = {
                 'count': len(df_rds),
@@ -421,7 +445,7 @@ def download_region_account(account_name, account_profile, region):
         try:
             logger.info(f"  ↳ VPC para {key}...")
             df_vpc = get_vpc_df(account_profile, region)
-            df_vpc = _enrich_with_audit(account_profile, region, 'vpc', df_vpc)
+            df_vpc = _enrich_resource_metadata(account_profile, region, 'vpc', df_vpc)
             compare_result = cache_manager.compare_and_update(account_name, region, 'vpc', df_vpc)
             result['resources']['vpc'] = {
                 'count': len(df_vpc),
@@ -437,7 +461,7 @@ def download_region_account(account_name, account_profile, region):
         try:
             logger.info(f"  ↳ VPC Outbound IPs para {key}...")
             df_vpc_out = _get_vpc_outbound_ips(account_profile, region)
-            df_vpc_out = _enrich_with_audit(account_profile, region, 'vpc_outbound_ips', df_vpc_out)
+            df_vpc_out = _enrich_resource_metadata(account_profile, region, 'vpc_outbound_ips', df_vpc_out)
             compare_result = cache_manager.compare_and_update(
                 account_name, region, 'vpc_outbound_ips', df_vpc_out
             )
@@ -459,7 +483,7 @@ def download_region_account(account_name, account_profile, region):
             try:
                 logger.info(f"  ↳ S3 para {account_name}...")
                 df_s3 = get_s3_df(account_profile)
-                df_s3 = _enrich_with_audit(account_profile, region, 's3', df_s3)
+                df_s3 = _enrich_resource_metadata(account_profile, region, 's3', df_s3)
                 compare_result = cache_manager.compare_and_update(account_name, region, 's3', df_s3)
                 result['resources']['s3'] = {
                     'count': len(df_s3),
@@ -476,7 +500,7 @@ def download_region_account(account_name, account_profile, region):
             try:
                 logger.info(f"  ↳ IAM Users para {account_name}...")
                 df_iam = get_iam_users_df(account_profile)
-                df_iam = _enrich_with_audit(account_profile, region, 'iam_users', df_iam)
+                df_iam = _enrich_resource_metadata(account_profile, region, 'iam_users', df_iam)
                 compare_result = cache_manager.compare_and_update(account_name, region, 'iam_users', df_iam)
                 result['resources']['iam_users'] = {
                     'count': len(df_iam),
@@ -492,7 +516,7 @@ def download_region_account(account_name, account_profile, region):
         try:
             logger.info(f"  ↳ Lambda para {key}...")
             df_lambda = get_lambda_df(account_profile, region)
-            df_lambda = _enrich_with_audit(account_profile, region, 'lambda', df_lambda)
+            df_lambda = _enrich_resource_metadata(account_profile, region, 'lambda', df_lambda)
             compare_result = cache_manager.compare_and_update(account_name, region, 'lambda', df_lambda)
             result['resources']['lambda'] = {
                 'count': len(df_lambda),
@@ -508,7 +532,7 @@ def download_region_account(account_name, account_profile, region):
         try:
             logger.info(f"  ↳ API Gateway para {key}...")
             df_api = get_api_gateway_df(account_profile, region)
-            df_api = _enrich_with_audit(account_profile, region, 'api_gateway', df_api)
+            df_api = _enrich_resource_metadata(account_profile, region, 'api_gateway', df_api)
             compare_result = cache_manager.compare_and_update(account_name, region, 'api_gateway', df_api)
             result['resources']['api_gateway'] = {
                 'count': len(df_api),
@@ -524,7 +548,7 @@ def download_region_account(account_name, account_profile, region):
         try:
             logger.info(f"  ↳ API Gateway Routes para {key}...")
             df_api_routes = get_api_gateway_routes_df(account_profile, region)
-            df_api_routes = _enrich_with_audit(
+            df_api_routes = _enrich_resource_metadata(
                 account_profile, region, 'api_gateway_routes', df_api_routes
             )
             compare_result = cache_manager.compare_and_update(
@@ -544,7 +568,7 @@ def download_region_account(account_name, account_profile, region):
         try:
             logger.info(f"  â†³ CloudFormation para {key}...")
             df_cloudformation = get_cloudformation_df(account_profile, region)
-            df_cloudformation = _enrich_with_audit(
+            df_cloudformation = _enrich_resource_metadata(
                 account_profile, region, 'cloudformation', df_cloudformation
             )
             compare_result = cache_manager.compare_and_update(
@@ -564,7 +588,7 @@ def download_region_account(account_name, account_profile, region):
         try:
             logger.info(f"  â†³ SSM para {key}...")
             df_ssm = get_ssm_df(account_profile, region)
-            df_ssm = _enrich_with_audit(account_profile, region, 'ssm', df_ssm)
+            df_ssm = _enrich_resource_metadata(account_profile, region, 'ssm', df_ssm)
             compare_result = cache_manager.compare_and_update(
                 account_name, region, 'ssm', df_ssm
             )
@@ -582,7 +606,7 @@ def download_region_account(account_name, account_profile, region):
         try:
             logger.info(f"  â†³ KMS para {key}...")
             df_kms = get_kms_df(account_profile, region)
-            df_kms = _enrich_with_audit(account_profile, region, 'kms', df_kms)
+            df_kms = _enrich_resource_metadata(account_profile, region, 'kms', df_kms)
             compare_result = cache_manager.compare_and_update(
                 account_name, region, 'kms', df_kms
             )
@@ -600,7 +624,7 @@ def download_region_account(account_name, account_profile, region):
         try:
             logger.info(f"  â†³ DynamoDB para {key}...")
             df_dynamodb = get_dynamodb_df(account_profile, region)
-            df_dynamodb = _enrich_with_audit(account_profile, region, 'dynamodb', df_dynamodb)
+            df_dynamodb = _enrich_resource_metadata(account_profile, region, 'dynamodb', df_dynamodb)
             compare_result = cache_manager.compare_and_update(
                 account_name, region, 'dynamodb', df_dynamodb
             )
@@ -618,7 +642,7 @@ def download_region_account(account_name, account_profile, region):
         try:
             logger.info(f"  â†³ SQS para {key}...")
             df_sqs = get_sqs_df(account_profile, region)
-            df_sqs = _enrich_with_audit(account_profile, region, 'sqs', df_sqs)
+            df_sqs = _enrich_resource_metadata(account_profile, region, 'sqs', df_sqs)
             compare_result = cache_manager.compare_and_update(
                 account_name, region, 'sqs', df_sqs
             )

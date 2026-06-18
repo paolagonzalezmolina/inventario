@@ -6,11 +6,15 @@ Inventario AWS multi-cuenta en tiempo real.
 
 import logging
 import re
+import html as html_lib
+from datetime import date, timedelta
 from pathlib import Path
 
+import boto3
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 from pandas.api.types import is_numeric_dtype
 
 from cache_manager import cache_manager
@@ -33,8 +37,71 @@ st.set_page_config(
 )
 
 GLOBAL_SERVICES = {"s3", "iam_users"}
+ALL_ACCOUNTS_OPTION = "__all_accounts__"
 ALL_REGIONS_OPTION = "__all_regions__"
 PRIORITY_REGIONS = ["us-east-1", "us-east-2"]
+ACCOUNT_DISPLAY_ORDER = ["afex-prod", "afex-digital", "afex-peru", "afex-des"]
+MANDATORY_TAGS = ["Name", "Environment", "Owner", "CostCenter", "Application"]
+
+ANALYTICS_SERVICE_LABELS = [
+    ("ec2", "EC2", False),
+    ("rds", "RDS", False),
+    ("vpc", "VPC", False),
+    ("vpc_outbound_ips", "NAT/IPs salida", False),
+    ("lambda", "Lambda", False),
+    ("api_gateway", "API Gateway", False),
+    ("api_gateway_routes", "API Gateway -> Lambda", False),
+    ("cloudformation", "CloudFormation", False),
+    ("ssm", "SSM", False),
+    ("kms", "KMS", False),
+    ("dynamodb", "DynamoDB", False),
+    ("sqs", "SQS", False),
+    ("s3", "S3", True),
+    ("iam_users", "IAM Users", True),
+]
+
+TAG_COLUMN_CANDIDATES = ["tags", "Tags", "tag_set", "TagSet"]
+PRODUCT_TAG_KEYS = ["Application", "Product", "Service", "Project", "Sistema", "App"]
+PRODUCT_NAME_STOPWORDS = {
+    "afex",
+    "prod",
+    "prd",
+    "cert",
+    "qa",
+    "dev",
+    "des",
+    "test",
+    "uat",
+    "api",
+    "lambda",
+    "function",
+    "functions",
+    "table",
+    "queue",
+    "bucket",
+    "db",
+    "database",
+    "rds",
+    "dynamodb",
+    "sqs",
+    "s3",
+    "vpc",
+    "subnet",
+    "role",
+    "iam",
+    "log",
+    "logs",
+    "cloudwatch",
+    "cloudformation",
+    "stack",
+    "service",
+    "services",
+    "app",
+    "us",
+    "east",
+    "west",
+    "sa",
+}
 
 REGION_DISPLAY_NAMES = {
     "us-east-1": "Virginia",
@@ -178,6 +245,20 @@ def get_account_regions(account_name):
     return PERFILES.get(account_name, {}).get("regiones") or ["us-east-1"]
 
 
+def get_account_display_label(account_name):
+    """Retorna etiqueta legible para el selector de cuenta."""
+    if account_name == ALL_ACCOUNTS_OPTION:
+        return "Todas las cuentas"
+    return account_name
+
+
+def get_selected_account_names(account_name):
+    """Expande la opcion global a la lista real de cuentas."""
+    if account_name == ALL_ACCOUNTS_OPTION:
+        return list(PERFILES.keys())
+    return [account_name]
+
+
 def get_global_region(account_name):
     """Retorna la region base donde se guardan servicios globales."""
     return PERFILES.get(account_name, {}).get("region") or "us-east-1"
@@ -200,6 +281,15 @@ def get_scope_display_label(region_code):
 
 def get_prioritized_regions(account_name):
     """Ordena regiones priorizando Virginia/Ohio y luego el resto alfabeticamente."""
+    if account_name == ALL_ACCOUNTS_OPTION:
+        regions = []
+        for real_account in get_selected_account_names(account_name):
+            regions.extend(get_account_regions(real_account))
+        regions = list(dict.fromkeys(regions))
+        prioritized = [region for region in PRIORITY_REGIONS if region in regions]
+        remaining = sorted(region for region in regions if region not in prioritized)
+        return prioritized + remaining
+
     regions = list(dict.fromkeys(get_account_regions(account_name)))
     prioritized = [region for region in PRIORITY_REGIONS if region in regions]
     remaining = sorted(region for region in regions if region not in prioritized)
@@ -266,6 +356,31 @@ def make_dataframe_concat_safe(df):
 
 def load_account_service_dataframe(account_name, service_key, selected_region):
     """Carga un servicio para una cuenta en una region puntual o consolidado."""
+    if account_name == ALL_ACCOUNTS_OPTION:
+        frames = []
+        statuses = []
+        exists_any = False
+        for real_account in get_selected_account_names(account_name):
+            account_df, account_status, account_exists = load_account_service_dataframe(
+                real_account,
+                service_key,
+                selected_region,
+            )
+            statuses.append(account_status)
+            exists_any = exists_any or account_exists
+            if isinstance(account_df, pd.DataFrame) and not account_df.empty:
+                frames.append(account_df)
+
+        if not frames:
+            return pd.DataFrame(), "Sin datos" if not exists_any else "Viejo", exists_any
+
+        combined = pd.concat(frames, ignore_index=True)
+        if all(status == "Fresco" for status in statuses if status != "Sin datos"):
+            return combined, "Fresco", True
+        if any(status == "Fresco" for status in statuses):
+            return combined, "Mixto", True
+        return combined, "Viejo", True
+
     if service_key in GLOBAL_SERVICES:
         global_region = get_global_region(account_name)
         data, is_fresh, exists = load_cached_dataframe(account_name, global_region, service_key)
@@ -588,6 +703,1198 @@ def sanitize_dataframe_for_display(df):
     return sanitized
 
 
+def ensure_monitoring_alert_columns(df):
+    """Asegura columnas de alertas en tablas de infraestructura."""
+    if df is None or df.empty:
+        return df
+    enriched = df.copy()
+    defaults = {
+        "alertas_configuradas": "Pendiente de descarga",
+        "alertas_count": "",
+        "alertas_email_configurado": "Pendiente de descarga",
+        "alertas_nombres": "",
+        "alertas_metricas": "",
+        "alertas_acciones": "",
+        "alertas_emails": "",
+    }
+    for column, default_value in defaults.items():
+        if column not in enriched.columns:
+            enriched[column] = default_value
+    return enriched
+
+
+def _selected_regions_for_scope(account_name, selected_region):
+    """Retorna las regiones concretas cubiertas por el selector actual."""
+    if selected_region == ALL_REGIONS_OPTION:
+        return get_prioritized_regions(account_name)
+    return [selected_region]
+
+
+def _service_regions_for_scope(account_name, selected_region, service_key):
+    """Retorna regiones donde buscar un servicio, respetando global/regional."""
+    if service_key in GLOBAL_SERVICES:
+        return [get_global_region(account_name)]
+    return _selected_regions_for_scope(account_name, selected_region)
+
+
+def _load_service_scope_rows(account_name, selected_region, service_key, display_name):
+    """Carga filas cacheadas de un servicio y agrega metadatos de cuenta/region."""
+    rows = []
+    for real_account in get_selected_account_names(account_name):
+        for region in _service_regions_for_scope(real_account, selected_region, service_key):
+            data, is_fresh, exists = load_cached_dataframe(real_account, region, service_key)
+            if not (exists and isinstance(data, pd.DataFrame) and not data.empty):
+                continue
+            service_df = make_dataframe_concat_safe(data)
+            service_df["cuenta"] = real_account
+            if "region" not in service_df.columns:
+                service_df["region"] = region
+            service_df["servicio"] = display_name
+            service_df["cache_fresco"] = is_fresh
+            rows.append(service_df)
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
+
+
+def build_coverage_dataframe(account_name, selected_region):
+    """Construye matriz de cobertura de cache por servicio y region."""
+    rows = []
+    for service_key, display_name, is_global in ANALYTICS_SERVICE_LABELS:
+        for region in _service_regions_for_scope(account_name, selected_region, service_key):
+            data, is_fresh, exists = load_cached_dataframe(account_name, region, service_key)
+            row_count = len(data) if exists and isinstance(data, pd.DataFrame) else 0
+            if exists and row_count > 0:
+                status = "Descargado"
+            elif exists:
+                status = "Descargado sin recursos"
+            else:
+                status = "Falta descargar"
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": region,
+                    "Servicio": display_name,
+                    "Tipo": "Global" if is_global else "Regional",
+                    "Estado": status,
+                    "Registros": row_count,
+                    "Cache": "Fresco" if is_fresh else "Viejo" if exists else "Sin datos",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _normalize_tags(value):
+    """Convierte tags AWS comunes a dict simple."""
+    if value is None or value == "":
+        return {}
+    if isinstance(value, dict):
+        return {str(key): str(val) for key, val in value.items()}
+    if isinstance(value, list):
+        normalized = {}
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("Key") or item.get("key")
+            val = item.get("Value") or item.get("value") or ""
+            if key:
+                normalized[str(key)] = str(val)
+        return normalized
+    return {}
+
+
+def _extract_row_tags(row):
+    """Extrae tags desde columnas conocidas o columnas tag:<nombre>."""
+    tags = {}
+    for column in TAG_COLUMN_CANDIDATES:
+        if column in row.index:
+            tags.update(_normalize_tags(row.get(column)))
+    for column in row.index:
+        column_text = str(column)
+        if column_text.lower().startswith("tag:"):
+            key = column_text.split(":", 1)[1]
+            value = row.get(column)
+            if value is not None and str(value).strip():
+                tags[key] = str(value)
+    return tags
+
+
+def _resource_identifier(row):
+    """Obtiene un identificador legible para hallazgos."""
+    for column in ["nombre", "name", "id", "resource_id", "arn", "url", "username", "key_id"]:
+        if column in row.index:
+            value = row.get(column)
+            if value is not None and str(value).strip():
+                return str(value)
+    return "Sin identificador"
+
+
+def build_tag_compliance_dataframe(account_name, selected_region):
+    """Construye analisis transversal de tags obligatorios."""
+    rows = []
+    for service_key, display_name, _ in ANALYTICS_SERVICE_LABELS:
+        data = _load_service_scope_rows(account_name, selected_region, service_key, display_name)
+        if data.empty:
+            continue
+        for _, row in data.iterrows():
+            tags = _extract_row_tags(row)
+            present_required_tags = [tag for tag in MANDATORY_TAGS if tags.get(tag)]
+            missing_tags = [tag for tag in MANDATORY_TAGS if not tags.get(tag)]
+            compliance_ratio = len(present_required_tags) / len(MANDATORY_TAGS)
+            if compliance_ratio == 1:
+                tag_status = "Cumple"
+            elif tags:
+                tag_status = "Validado con faltantes"
+            else:
+                tag_status = "Sin evidencia de tags"
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Servicio": display_name,
+                    "Recurso": _resource_identifier(row),
+                    "Estado tags": tag_status,
+                    "Tags obligatorios presentes": (
+                        f"{len(present_required_tags)} de {len(MANDATORY_TAGS)} "
+                        f"({compliance_ratio:.0%})"
+                    ),
+                    "Tags presentes": ", ".join(present_required_tags) if present_required_tags else "Ninguno",
+                    "Tags faltantes": ", ".join(missing_tags) if missing_tags else "Ninguno",
+                    "Cumple tags": tag_status == "Cumple",
+                    "Evidencia disponible": "Si" if tags else "No",
+                    **{f"Tag {tag}": tags.get(tag, "") for tag in MANDATORY_TAGS},
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _get_numeric(row, columns, default=0):
+    for column in columns:
+        if column in row.index:
+            try:
+                return float(row.get(column) or 0)
+            except (TypeError, ValueError):
+                return default
+    return default
+
+
+def build_billing_recommendations_dataframe(account_name, selected_region):
+    """Genera hallazgos FinOps desde el inventario cacheado."""
+    rows = []
+
+    ec2_df = _load_service_scope_rows(account_name, selected_region, "ec2", "EC2")
+    for _, row in ec2_df.iterrows():
+        if str(row.get("estado", "")).lower() == "stopped":
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Servicio": "EC2",
+                    "Recurso": _resource_identifier(row),
+                    "Hallazgo": "Instancia detenida",
+                    "Accion recomendada": "Validar si puede eliminarse, apagarse definitivamente o convertir a AMI.",
+                    "Prioridad": "Media",
+                }
+            )
+        if str(row.get("monitoringState", "")).lower() == "disabled":
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Servicio": "EC2",
+                    "Recurso": _resource_identifier(row),
+                    "Hallazgo": "Monitoreo detallado deshabilitado",
+                    "Accion recomendada": "Revisar si requiere metricas detalladas antes de optimizar capacidad.",
+                    "Prioridad": "Baja",
+                }
+            )
+
+    nat_df = _load_service_scope_rows(account_name, selected_region, "vpc_outbound_ips", "NAT/IPs")
+    for _, row in nat_df.iterrows():
+        if row.get("type") == "Elastic IP" and row.get("state") == "available":
+            public_ip = row.get("public_ip", "")
+            allocation_id = row.get("allocation_id", "")
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Servicio": "Elastic IP",
+                    "Recurso": public_ip or allocation_id or _resource_identifier(row),
+                    "Hallazgo": "Elastic IP disponible sin asociacion",
+                    "Accion recomendada": (
+                        f"Liberar si no esta reservada para una actividad planificada. "
+                        f"AllocationId: {allocation_id or 'N/A'}"
+                    ),
+                    "Prioridad": "Alta",
+                }
+            )
+        if row.get("type") == "NAT Gateway" and row.get("state") != "available":
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Servicio": "NAT Gateway",
+                    "Recurso": _resource_identifier(row),
+                    "Hallazgo": f"NAT Gateway en estado {row.get('state')}",
+                    "Accion recomendada": "Confirmar si corresponde mantenerlo o limpiar recursos asociados.",
+                    "Prioridad": "Media",
+                }
+            )
+
+    rds_df = _load_service_scope_rows(account_name, selected_region, "rds", "RDS")
+    for _, row in rds_df.iterrows():
+        storage = _get_numeric(row, ["almacenamiento_gb"])
+        if storage >= 1000:
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Servicio": "RDS",
+                    "Recurso": _resource_identifier(row),
+                    "Hallazgo": f"Almacenamiento alto ({storage:.0f} GB)",
+                    "Accion recomendada": "Revisar metricas de uso, retencion y politica de snapshots.",
+                    "Prioridad": "Media",
+                }
+            )
+        if str(row.get("estado", "")).lower() not in {"available", "storage-optimization"}:
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Servicio": "RDS",
+                    "Recurso": _resource_identifier(row),
+                    "Hallazgo": f"Estado no disponible: {row.get('estado')}",
+                    "Accion recomendada": "Validar si genera costo sin entregar servicio.",
+                    "Prioridad": "Alta",
+                }
+            )
+
+    dynamodb_df = _load_service_scope_rows(account_name, selected_region, "dynamodb", "DynamoDB")
+    for _, row in dynamodb_df.iterrows():
+        if str(row.get("billing_mode", "")).upper() == "PROVISIONED":
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Servicio": "DynamoDB",
+                    "Recurso": _resource_identifier(row),
+                    "Hallazgo": "Tabla en modo PROVISIONED",
+                    "Accion recomendada": "Comparar consumo real contra capacidad provisionada o evaluar on-demand.",
+                    "Prioridad": "Media",
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["Cuenta", "Region", "Servicio", "Recurso", "Hallazgo", "Accion recomendada", "Prioridad"]
+        )
+    return pd.DataFrame(rows)
+
+
+def fetch_cost_explorer_dataframe(account_name):
+    """Consulta Cost Explorer para la cuenta seleccionada si existen permisos."""
+    if account_name == ALL_ACCOUNTS_OPTION:
+        frames = []
+        for real_account in get_selected_account_names(account_name):
+            account_df = fetch_cost_explorer_dataframe(real_account)
+            if not account_df.empty:
+                account_df["Cuenta"] = real_account
+                frames.append(account_df)
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    profile_name = PERFILES.get(account_name, {}).get("perfil")
+    if not profile_name:
+        return pd.DataFrame()
+
+    session = boto3.Session(profile_name=profile_name)
+    client = session.client("ce", region_name="us-east-1")
+    today = date.today()
+    end_date = today + timedelta(days=1)
+    start_month = (today.replace(day=1) - timedelta(days=90)).replace(day=1)
+
+    response = client.get_cost_and_usage(
+        TimePeriod={"Start": start_month.isoformat(), "End": end_date.isoformat()},
+        Granularity="MONTHLY",
+        Metrics=["UnblendedCost"],
+        GroupBy=[
+            {"Type": "DIMENSION", "Key": "SERVICE"},
+            {"Type": "DIMENSION", "Key": "REGION"},
+        ],
+    )
+
+    rows = []
+    for period in response.get("ResultsByTime", []):
+        month = period.get("TimePeriod", {}).get("Start")
+        for group in period.get("Groups", []):
+            service, region = (group.get("Keys") or ["Sin servicio", "Sin region"])[:2]
+            metric = group.get("Metrics", {}).get("UnblendedCost", {})
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Mes": month,
+                    "Servicio": service,
+                    "Region": region or "Global",
+                    "Costo USD": float(metric.get("Amount", 0)),
+                    "Moneda": metric.get("Unit", "USD"),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _current_and_previous_months(cost_df):
+    """Retorna etiquetas de mes actual y anterior segun datos consultados."""
+    if cost_df.empty or "Mes" not in cost_df.columns:
+        return None, None
+    months = sorted(cost_df["Mes"].dropna().astype(str).unique())
+    if not months:
+        return None, None
+    current_month = months[-1]
+    previous_month = months[-2] if len(months) > 1 else None
+    return current_month, previous_month
+
+
+def build_cost_dashboard_metrics(cost_df):
+    """Calcula KPIs ejecutivos para Billing."""
+    if cost_df.empty:
+        return {
+            "current_month": None,
+            "current_total": 0.0,
+            "previous_total": 0.0,
+            "variation_pct": 0.0,
+            "active_services": 0,
+        }
+
+    current_month, previous_month = _current_and_previous_months(cost_df)
+    current_df = cost_df[cost_df["Mes"] == current_month] if current_month else pd.DataFrame()
+    previous_df = cost_df[cost_df["Mes"] == previous_month] if previous_month else pd.DataFrame()
+    current_total = float(current_df["Costo USD"].sum()) if not current_df.empty else 0.0
+    previous_total = float(previous_df["Costo USD"].sum()) if not previous_df.empty else 0.0
+    variation_pct = ((current_total - previous_total) / previous_total * 100) if previous_total else 0.0
+    active_services = int(current_df[current_df["Costo USD"] > 0]["Servicio"].nunique()) if not current_df.empty else 0
+
+    return {
+        "current_month": current_month,
+        "current_total": current_total,
+        "previous_total": previous_total,
+        "variation_pct": variation_pct,
+        "active_services": active_services,
+    }
+
+
+def filter_costs_by_selected_scope(cost_df, selected_region):
+    """Filtra costos por region cuando el usuario selecciona una region puntual."""
+    if cost_df.empty or selected_region == ALL_REGIONS_OPTION:
+        return cost_df
+    valid_regions = {selected_region, get_region_display_label(selected_region), "Global", "NoRegion", ""}
+    return cost_df[cost_df["Region"].fillna("").isin(valid_regions)]
+
+
+def get_current_month_costs(cost_df):
+    """Obtiene costos del mes mas reciente disponible."""
+    current_month, _ = _current_and_previous_months(cost_df)
+    if not current_month:
+        return pd.DataFrame()
+    return cost_df[cost_df["Mes"] == current_month].copy()
+
+
+def map_cost_service_to_inventory_service(service_name):
+    """Mapea nombres de Cost Explorer a servicios del inventario para estimaciones."""
+    text = str(service_name or "").lower()
+    mapping = [
+        ("DynamoDB", ["dynamodb"]),
+        ("Lambda", ["lambda"]),
+        ("RDS", ["relational database", "rds"]),
+        ("S3", ["simple storage", " s3", "amazon s3"]),
+        ("SQS", ["simple queue", "sqs"]),
+        ("API Gateway", ["api gateway"]),
+        ("VPC", ["vpc", "nat gateway", "elastic ip", "data transfer"]),
+        ("EC2", ["ec2", "elastic compute", "compute cloud"]),
+        ("KMS", ["key management", "kms"]),
+        ("CloudFormation", ["cloudformation"]),
+        ("SSM", ["systems manager", "ssm"]),
+        ("IAM Users", ["identity and access", "iam"]),
+    ]
+    for inventory_service, needles in mapping:
+        if any(needle in text for needle in needles):
+            return inventory_service
+    return ""
+
+
+def build_cost_by_service_dataframe(cost_df):
+    """Agrupa costo del mes actual por servicio AWS."""
+    current_df = get_current_month_costs(cost_df)
+    if current_df.empty:
+        return pd.DataFrame(columns=["Servicio", "Costo USD", "% del Total"])
+    grouped = (
+        current_df.groupby("Servicio", as_index=False)["Costo USD"]
+        .sum()
+        .sort_values("Costo USD", ascending=False)
+    )
+    total = grouped["Costo USD"].sum()
+    grouped["% del Total"] = grouped["Costo USD"].apply(lambda value: (value / total * 100) if total else 0)
+    return grouped
+
+
+def build_estimated_product_cost_dataframe(account_name, selected_region, cost_df):
+    """Estima costo por producto distribuyendo costo por servicio segun recursos detectados."""
+    product_df = build_product_inventory_dataframe(account_name, selected_region)
+    current_df = get_current_month_costs(filter_costs_by_selected_scope(cost_df, selected_region))
+    if product_df.empty or current_df.empty:
+        return pd.DataFrame(columns=["Producto", "Recursos", "Costo Mensual USD", "% del Total", "Metodo"])
+
+    current_df = current_df.copy()
+    current_df["Servicio inventario"] = current_df["Servicio"].apply(map_cost_service_to_inventory_service)
+    mapped_costs = (
+        current_df[current_df["Servicio inventario"] != ""]
+        .groupby("Servicio inventario", as_index=False)["Costo USD"]
+        .sum()
+    )
+
+    allocation_rows = []
+    for _, cost_row in mapped_costs.iterrows():
+        inventory_service = cost_row["Servicio inventario"]
+        service_resources = product_df[product_df["Servicio"] == inventory_service]
+        if service_resources.empty:
+            continue
+        counts = service_resources.groupby("Producto", as_index=False).size()
+        total_count = counts["size"].sum()
+        if total_count <= 0:
+            continue
+        for _, count_row in counts.iterrows():
+            allocation_rows.append(
+                {
+                    "Producto": count_row["Producto"],
+                    "Recursos asignados": int(count_row["size"]),
+                    "Costo asignado": float(cost_row["Costo USD"]) * int(count_row["size"]) / total_count,
+                }
+            )
+
+    if not allocation_rows:
+        return pd.DataFrame(columns=["Producto", "Recursos", "Costo Mensual USD", "% del Total", "Metodo"])
+
+    allocation_df = pd.DataFrame(allocation_rows)
+    product_resources = product_df.groupby("Producto", as_index=False).size()
+    product_resources.columns = ["Producto", "Recursos"]
+    summary = (
+        allocation_df.groupby("Producto", as_index=False)
+        .agg({"Costo asignado": "sum", "Recursos asignados": "sum"})
+        .merge(product_resources, on="Producto", how="left")
+    )
+    total_cost = summary["Costo asignado"].sum()
+    summary["Costo Mensual USD"] = summary["Costo asignado"]
+    summary["% del Total"] = summary["Costo Mensual USD"].apply(lambda value: (value / total_cost * 100) if total_cost else 0)
+    summary["Metodo"] = "Estimado por recursos del inventario"
+    return summary[["Producto", "Recursos", "Costo Mensual USD", "% del Total", "Metodo"]].sort_values(
+        "Costo Mensual USD",
+        ascending=False,
+    )
+
+
+def build_vulnerability_dataframe(account_name, selected_region):
+    """Genera hallazgos de version/configuracion desde inventario disponible."""
+    rows = []
+
+    deprecated_lambda_runtimes = {
+        "nodejs10.x",
+        "nodejs12.x",
+        "nodejs14.x",
+        "python2.7",
+        "python3.6",
+        "python3.7",
+        "ruby2.7",
+        "java8",
+        "dotnetcore2.1",
+        "dotnetcore3.1",
+    }
+
+    lambda_df = _load_service_scope_rows(account_name, selected_region, "lambda", "Lambda")
+    for _, row in lambda_df.iterrows():
+        runtime = str(row.get("runtime", "")).strip()
+        if runtime in deprecated_lambda_runtimes:
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Servicio": "Lambda",
+                    "Recurso": _resource_identifier(row),
+                    "Riesgo": f"Runtime obsoleto o deprecado: {runtime}",
+                    "Version actual": runtime,
+                    "Version objetivo": "Runtime soportado vigente para el lenguaje",
+                    "Prioridad": "Alta",
+                }
+            )
+        if str(row.get("estado_ultima_actualizacion", "")).lower() not in {"successful", "n/a", ""}:
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Servicio": "Lambda",
+                    "Recurso": _resource_identifier(row),
+                    "Riesgo": f"Ultima actualizacion en estado {row.get('estado_ultima_actualizacion')}",
+                    "Version actual": runtime,
+                    "Version objetivo": "Successful",
+                    "Prioridad": "Media",
+                }
+            )
+
+    rds_df = _load_service_scope_rows(account_name, selected_region, "rds", "RDS")
+    for _, row in rds_df.iterrows():
+        engine = str(row.get("motor", "")).lower()
+        version = str(row.get("version", "")).strip()
+        major = version.split(".", 1)[0] if version else ""
+        priority = None
+        if engine in {"mysql", "mariadb"} and major in {"5", "10"}:
+            priority = "Alta" if major == "5" else "Media"
+        elif engine == "postgres" and major in {"9", "10", "11", "12"}:
+            priority = "Alta" if major in {"9", "10", "11"} else "Media"
+        if priority:
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Servicio": "RDS",
+                    "Recurso": _resource_identifier(row),
+                    "Riesgo": f"Motor/version requiere revision: {engine} {version}",
+                    "Version actual": version,
+                    "Version objetivo": "Version soportada por AWS y estandar interno",
+                    "Prioridad": priority,
+                }
+            )
+        if not bool(row.get("multi_az", False)):
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Servicio": "RDS",
+                    "Recurso": _resource_identifier(row),
+                    "Riesgo": "Base de datos sin Multi-AZ",
+                    "Version actual": version,
+                    "Version objetivo": "Multi-AZ para componentes criticos",
+                    "Prioridad": "Media",
+                }
+            )
+
+    iam_df = _load_service_scope_rows(account_name, selected_region, "iam_users", "IAM Users")
+    for _, row in iam_df.iterrows():
+        if row.get("mfa_enabled") is False:
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Servicio": "IAM",
+                    "Recurso": _resource_identifier(row),
+                    "Riesgo": "Usuario IAM sin MFA",
+                    "Version actual": "MFA deshabilitado",
+                    "Version objetivo": "MFA habilitado",
+                    "Prioridad": "Alta",
+                }
+            )
+
+    s3_df = _load_service_scope_rows(account_name, selected_region, "s3", "S3")
+    for _, row in s3_df.iterrows():
+        if row.get("region") == "unknown":
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Servicio": "S3",
+                    "Recurso": _resource_identifier(row),
+                    "Riesgo": "No se pudo determinar region del bucket",
+                    "Version actual": "Sin evidencia completa",
+                    "Version objetivo": "Inventario con metadata completa",
+                    "Prioridad": "Media",
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "Cuenta",
+                "Region",
+                "Servicio",
+                "Recurso",
+                "Riesgo",
+                "Version actual",
+                "Version objetivo",
+                "Prioridad",
+            ]
+        )
+    return pd.DataFrame(rows)
+
+
+def _humanize_product_name(value):
+    """Convierte una clave detectada en nombre legible."""
+    text = str(value or "").strip()
+    if not text:
+        return "Sin producto"
+    parts = [part for part in re.split(r"[_\-\s.]+", text) if part]
+    if not parts:
+        return "Sin producto"
+    return " ".join(part.upper() if len(part) <= 3 else part.capitalize() for part in parts)
+
+
+def _infer_product_from_tags(row):
+    """Busca tags que normalmente identifican producto/aplicacion."""
+    tags = _extract_row_tags(row)
+    for key in PRODUCT_TAG_KEYS:
+        value = tags.get(key)
+        if value and str(value).strip():
+            product_key = normalize_component_name(value)
+            if product_key:
+                return product_key, _humanize_product_name(value), "Tag", "Alta"
+    return "", "", "", ""
+
+
+def _infer_product_from_name(value):
+    """Deduce producto desde nombres de recursos cuando no hay tag util."""
+    if value is None:
+        return "", "", "", ""
+
+    text = str(value).strip()
+    if not text:
+        return "", "", "", ""
+
+    normalized = normalize_component_name(text)
+    tokens = [
+        token
+        for token in re.split(r"[_\-\s.]+", normalized)
+        if token and not token.isdigit() and token not in PRODUCT_NAME_STOPWORDS
+    ]
+    tokens = [
+        token
+        for token in tokens
+        if not re.match(r"^(i|vpc|subnet|sg|rtb|nat|eipalloc|eni)-?[a-f0-9]+$", token)
+    ]
+    if not tokens:
+        return "", "", "", ""
+
+    if len(tokens) >= 2 and tokens[1] not in PRODUCT_NAME_STOPWORDS:
+        selected_tokens = tokens[:2]
+    else:
+        selected_tokens = tokens[:1]
+
+    product_key = "_".join(selected_tokens)
+    return product_key, _humanize_product_name(product_key), "Nombre", "Media"
+
+
+def _infer_product_for_row(row):
+    """Obtiene producto sugerido para una fila de inventario."""
+    tag_key, tag_name, source, confidence = _infer_product_from_tags(row)
+    if tag_key:
+        return tag_key, tag_name, source, confidence
+
+    for column in [
+        "api_nombre",
+        "lambda_function",
+        "nombre",
+        "name",
+        "id",
+        "resource_id",
+        "arn",
+        "url",
+        "username",
+        "key_id",
+    ]:
+        if column not in row.index:
+            continue
+        product_key, product_name, source, confidence = _infer_product_from_name(row.get(column))
+        if product_key:
+            return product_key, product_name, source, confidence
+
+    return "", "", "", ""
+
+
+def build_product_inventory_dataframe(account_name, selected_region):
+    """Agrupa recursos en productos sugeridos sin persistir cambios."""
+    rows = []
+    for service_key, display_name, _ in ANALYTICS_SERVICE_LABELS:
+        if service_key == "api_gateway_routes":
+            continue
+        data = _load_service_scope_rows(account_name, selected_region, service_key, display_name)
+        if data.empty:
+            continue
+
+        for _, row in data.iterrows():
+            product_key, product_name, source, confidence = _infer_product_for_row(row)
+            if not product_key:
+                continue
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Producto key": product_key,
+                    "Producto": product_name,
+                    "Servicio": display_name,
+                    "Recurso": _resource_identifier(row),
+                    "Origen deteccion": source,
+                    "Confianza": confidence,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "Cuenta",
+                "Region",
+                "Producto key",
+                "Producto",
+                "Servicio",
+                "Recurso",
+                "Origen deteccion",
+                "Confianza",
+            ]
+        )
+    return pd.DataFrame(rows)
+
+
+def build_product_relationships_dataframe(account_name, selected_region):
+    """Detecta relaciones conocidas entre servicios cacheados."""
+    rows = []
+    routes_df = _load_service_scope_rows(
+        account_name,
+        selected_region,
+        "api_gateway_routes",
+        "API Gateway -> Lambda",
+    )
+    if not routes_df.empty:
+        for _, row in routes_df.iterrows():
+            product_key, product_name, source, confidence = _infer_product_for_row(row)
+            if not product_key:
+                continue
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Region": row.get("region", ""),
+                    "Producto key": product_key,
+                    "Producto": product_name,
+                    "Relacion": "API Gateway -> Lambda",
+                    "Origen": row.get("api_nombre", row.get("api_id", "")),
+                    "Destino": row.get("lambda_function", row.get("lambda_arn", "")),
+                    "Detalle": row.get("route_key", row.get("ruta", "")),
+                    "Evidencia": "Integracion API Gateway",
+                    "Confianza": "Alta" if confidence != "Alta" else confidence,
+                    "Origen deteccion": source or "Relacion",
+                }
+            )
+
+    lambda_df = _load_service_scope_rows(account_name, selected_region, "lambda", "Lambda")
+    if not lambda_df.empty:
+        for _, row in lambda_df.iterrows():
+            product_key, product_name, source, confidence = _infer_product_for_row(row)
+            if not product_key:
+                continue
+            role_name = row.get("execution_role_name") or row.get("execution_role_arn")
+            if role_name:
+                rows.append(
+                    {
+                        "Cuenta": account_name,
+                        "Region": row.get("region", ""),
+                        "Producto key": product_key,
+                        "Producto": product_name,
+                        "Relacion": "Lambda -> IAM Role",
+                        "Origen": row.get("nombre", ""),
+                        "Destino": role_name,
+                        "Detalle": row.get("access_actions", ""),
+                        "Evidencia": "Rol de ejecucion Lambda",
+                        "Confianza": confidence,
+                        "Origen deteccion": source,
+                    }
+                )
+            if row.get("vpc"):
+                rows.append(
+                    {
+                        "Cuenta": account_name,
+                        "Region": row.get("region", ""),
+                        "Producto key": product_key,
+                        "Producto": product_name,
+                        "Relacion": "Lambda -> VPC",
+                        "Origen": row.get("nombre", ""),
+                        "Destino": row.get("vpc", ""),
+                        "Detalle": row.get("subnets", ""),
+                        "Evidencia": "Configuracion VPC Lambda",
+                        "Confianza": confidence,
+                        "Origen deteccion": source,
+                    }
+                )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "Cuenta",
+                "Region",
+                "Producto key",
+                "Producto",
+                "Relacion",
+                "Origen",
+                "Destino",
+                "Detalle",
+                "Evidencia",
+                "Confianza",
+                "Origen deteccion",
+            ]
+        )
+    return pd.DataFrame(rows)
+
+
+def build_product_summary_dataframe(product_df, relationships_df):
+    """Resume productos detectados con conteos y servicios involucrados."""
+    if product_df.empty and relationships_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Producto key",
+                "Producto",
+                "Recursos",
+                "Relaciones",
+                "Servicios",
+                "Confianza",
+                "Origen principal",
+                "Estado",
+            ]
+        )
+
+    product_keys = set(product_df.get("Producto key", pd.Series(dtype=str)).dropna())
+    product_keys.update(relationships_df.get("Producto key", pd.Series(dtype=str)).dropna())
+
+    rows = []
+    confidence_rank = {"Alta": 3, "Media": 2, "Baja": 1}
+    for product_key in sorted(product_keys):
+        resources = product_df[product_df["Producto key"] == product_key] if not product_df.empty else pd.DataFrame()
+        relations = (
+            relationships_df[relationships_df["Producto key"] == product_key]
+            if not relationships_df.empty
+            else pd.DataFrame()
+        )
+        product_name = ""
+        if not resources.empty:
+            product_name = resources.iloc[0].get("Producto", "")
+        elif not relations.empty:
+            product_name = relations.iloc[0].get("Producto", "")
+
+        services = sorted(set(resources.get("Servicio", pd.Series(dtype=str)).dropna()))
+        if not relations.empty:
+            relation_services = set()
+            for relation in relations["Relacion"].dropna():
+                relation_services.update(part.strip() for part in str(relation).split("->") if part.strip())
+            services = sorted(set(services) | relation_services)
+
+        confidences = list(resources.get("Confianza", pd.Series(dtype=str)).dropna())
+        confidences.extend(list(relations.get("Confianza", pd.Series(dtype=str)).dropna()))
+        confidence = max(confidences, key=lambda item: confidence_rank.get(item, 0)) if confidences else "Baja"
+        origins = list(resources.get("Origen deteccion", pd.Series(dtype=str)).dropna())
+        origins.extend(list(relations.get("Origen deteccion", pd.Series(dtype=str)).dropna()))
+        origin = sorted(set(origins))[0] if origins else "Nombre"
+
+        rows.append(
+            {
+                "Producto key": product_key,
+                "Producto": product_name or _humanize_product_name(product_key),
+                "Recursos": len(resources),
+                "Relaciones": len(relations),
+                "Servicios": ", ".join(services) if services else "Sin servicios asociados",
+                "Confianza": confidence,
+                "Origen principal": origin,
+                "Estado": "Sugerido",
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values(
+        by=["Recursos", "Relaciones", "Producto"],
+        ascending=[False, False, True],
+        kind="stable",
+    )
+
+
+INFRA_MAP_SERVICE_STYLES = {
+    "EC2": {"color": "#2563eb", "category": "Red"},
+    "VPC": {"color": "#0f766e", "category": "Red"},
+    "NAT/IPs salida": {"color": "#0891b2", "category": "Red"},
+    "RDS": {"color": "#7c3aed", "category": "Datos"},
+    "DynamoDB": {"color": "#3b82f6", "category": "Datos"},
+    "SQS": {"color": "#eab308", "category": "Datos"},
+    "Lambda": {"color": "#f59e0b", "category": "Serverless"},
+    "API Gateway": {"color": "#ef4444", "category": "Serverless"},
+    "S3": {"color": "#06b6d4", "category": "Global"},
+    "IAM Users": {"color": "#64748b", "category": "Global"},
+    "IAM Role": {"color": "#64748b", "category": "Global"},
+    "KMS": {"color": "#475569", "category": "Global"},
+    "SSM": {"color": "#475569", "category": "Global"},
+    "CloudFormation": {"color": "#2563eb", "category": "Otros"},
+    "CloudWatch Logs": {"color": "#334155", "category": "Otros"},
+}
+
+
+def _map_node_id(service_name, resource_name):
+    """Crea identificador estable para nodos del mapa."""
+    raw = f"{service_name}:{resource_name}"
+    normalized = re.sub(r"[^a-zA-Z0-9_]+", "_", raw).strip("_")
+    return normalized[:90] or "node"
+
+
+def _guess_map_service_from_relation(relation_name, value, side):
+    """Deduce tipo de servicio para nodos creados desde relaciones."""
+    relation_text = str(relation_name or "").lower()
+    value_text = str(value or "").lower()
+    if "api gateway" in relation_text and side == "source":
+        return "API Gateway"
+    if "lambda" in relation_text and ("lambda" in value_text or side == "target"):
+        return "Lambda"
+    if "iam role" in relation_text or ":role/" in value_text:
+        return "IAM Role"
+    if "vpc" in relation_text or value_text.startswith("vpc-"):
+        return "VPC"
+    if value_text.startswith("/aws/lambda/"):
+        return "CloudWatch Logs"
+    return "Otros"
+
+
+def build_infra_map(product_df, relationships_df, product_key, service_filter="Todos los servicios", max_nodes=60):
+    """Construye nodos y aristas para el mapa de infraestructura."""
+    resources = product_df[product_df["Producto key"] == product_key] if not product_df.empty else pd.DataFrame()
+    relationships = (
+        relationships_df[relationships_df["Producto key"] == product_key]
+        if not relationships_df.empty
+        else pd.DataFrame()
+    )
+
+    if service_filter != "Todos los servicios" and not resources.empty:
+        resources = resources[resources["Servicio"] == service_filter]
+
+    nodes = {}
+    edges = []
+
+    def add_node(service_name, resource_name, region="", source="Inventario"):
+        if not resource_name or str(resource_name).strip() == "":
+            return ""
+        service_name = service_name or "Otros"
+        node_id = _map_node_id(service_name, resource_name)
+        style = INFRA_MAP_SERVICE_STYLES.get(service_name, {"color": "#6b7280", "category": "Otros"})
+        if node_id not in nodes:
+            nodes[node_id] = {
+                "id": node_id,
+                "service": service_name,
+                "resource": str(resource_name),
+                "region": str(region or ""),
+                "source": source,
+                "color": style["color"],
+                "category": style["category"],
+            }
+        return node_id
+
+    for _, row in resources.head(max_nodes).iterrows():
+        add_node(row.get("Servicio", "Otros"), row.get("Recurso", ""), row.get("Region", ""), row.get("Origen deteccion", "Inventario"))
+
+    for _, row in relationships.iterrows():
+        source_service = _guess_map_service_from_relation(row.get("Relacion"), row.get("Origen"), "source")
+        target_service = _guess_map_service_from_relation(row.get("Relacion"), row.get("Destino"), "target")
+        source_id = add_node(source_service, row.get("Origen", ""), row.get("Region", ""), row.get("Evidencia", "Relacion"))
+        target_id = add_node(target_service, row.get("Destino", ""), row.get("Region", ""), row.get("Evidencia", "Relacion"))
+        if source_id and target_id:
+            edges.append(
+                {
+                    "from": source_id,
+                    "to": target_id,
+                    "label": str(row.get("Relacion", "")),
+                    "detail": str(row.get("Detalle", "")),
+                }
+            )
+
+    lambda_nodes = [node for node in nodes.values() if node["service"] == "Lambda"]
+    for node in lambda_nodes:
+        log_name = f"/aws/lambda/{node['resource']}"
+        log_id = add_node("CloudWatch Logs", log_name, node["region"], "Inferido")
+        if log_id:
+            edges.append({"from": log_id, "to": node["id"], "label": "logs for", "detail": "Convencion CloudWatch Logs"})
+
+    if len(nodes) > max_nodes:
+        keep_ids = set(list(nodes.keys())[:max_nodes])
+        nodes = {node_id: node for node_id, node in nodes.items() if node_id in keep_ids}
+        edges = [edge for edge in edges if edge["from"] in keep_ids and edge["to"] in keep_ids]
+
+    return list(nodes.values()), edges
+
+
+def render_infra_map_html(nodes, edges):
+    """Renderiza un mapa HTML/SVG simple, sin dependencias externas."""
+    if not nodes:
+        return "<div class='infra-map-empty'>No hay recursos para dibujar.</div>", 360
+
+    categories = ["Red", "Serverless", "Datos", "Global", "Otros"]
+    grouped = {category: [] for category in categories}
+    for node in nodes:
+        grouped.setdefault(node["category"], []).append(node)
+
+    card_w = 260
+    card_h = 92
+    gap_x = 56
+    lane_gap = 54
+    lane_header_h = 44
+    margin_x = 44
+    margin_y = 34
+    positions = {}
+    lane_blocks = []
+    card_blocks = []
+    y = margin_y
+    width = 1180
+
+    for category in categories:
+        category_nodes = grouped.get(category, [])
+        if not category_nodes:
+            continue
+        row_count = (len(category_nodes) + 2) // 3
+        lane_h = lane_header_h + row_count * card_h + max(0, row_count - 1) * 20 + 28
+        lane_blocks.append(
+            f"<div class='infra-lane' style='left:{margin_x}px; top:{y}px; width:{width - margin_x * 2}px; height:{lane_h}px;'>"
+            f"<div class='infra-lane-title'>{html_lib.escape(category)}</div></div>"
+        )
+        for idx, node in enumerate(category_nodes):
+            col = idx % 3
+            row = idx // 3
+            x = margin_x + 32 + col * (card_w + gap_x)
+            card_y = y + lane_header_h + row * (card_h + 20)
+            positions[node["id"]] = (x + card_w / 2, card_y + card_h / 2)
+            resource = html_lib.escape(node["resource"])
+            if len(resource) > 42:
+                resource = resource[:39] + "..."
+            service = html_lib.escape(node["service"].upper())
+            region = html_lib.escape(node["region"] or "global")
+            source = html_lib.escape(node["source"])
+            color = html_lib.escape(node["color"])
+            card_blocks.append(
+                f"<div class='infra-node' style='left:{x}px; top:{card_y}px; width:{card_w}px; height:{card_h}px; border-color:{color};'>"
+                f"<div class='infra-node-header' style='background:{color};'>{service}</div>"
+                f"<div class='infra-node-body'><strong title='{html_lib.escape(node['resource'])}'>{resource}</strong>"
+                f"<span>{html_lib.escape(node['service'].lower())} / {region}</span>"
+                f"<em>{source}</em></div></div>"
+            )
+        y += lane_h + lane_gap
+
+    height = max(y + 40, 480)
+    svg_lines = []
+    for edge in edges:
+        if edge["from"] not in positions or edge["to"] not in positions:
+            continue
+        x1, y1 = positions[edge["from"]]
+        x2, y2 = positions[edge["to"]]
+        mid_x = (x1 + x2) / 2
+        label = html_lib.escape(edge["label"])
+        svg_lines.append(
+            f"<path d='M{x1:.1f},{y1:.1f} C{mid_x:.1f},{y1:.1f} {mid_x:.1f},{y2:.1f} {x2:.1f},{y2:.1f}' "
+            f"class='infra-edge' marker-end='url(#arrow)' />"
+        )
+        svg_lines.append(
+            f"<text x='{mid_x:.1f}' y='{((y1 + y2) / 2) - 6:.1f}' class='infra-edge-label'>{label}</text>"
+        )
+
+    html = f"""
+    <style>
+    .infra-map-wrap {{
+        position: relative;
+        width: 100%;
+        height: {height}px;
+        overflow: auto;
+        background-color: #f8fafc;
+        background-image: radial-gradient(#dbe5dd 1px, transparent 1px);
+        background-size: 18px 18px;
+        border: 1px solid #d8e3db;
+        border-radius: 12px;
+    }}
+    .infra-lane {{
+        position: absolute;
+        border: 2px dashed #94a3b8;
+        border-radius: 18px;
+        background: rgba(255,255,255,0.55);
+    }}
+    .infra-lane-title {{
+        padding: 14px 22px;
+        color: #334155;
+        font-size: 20px;
+        font-weight: 700;
+    }}
+    .infra-node {{
+        position: absolute;
+        background: #ffffff;
+        border: 3px solid #64748b;
+        border-radius: 12px;
+        box-shadow: 0 12px 28px rgba(15,23,42,0.08);
+        overflow: hidden;
+        z-index: 2;
+    }}
+    .infra-node-header {{
+        color: #ffffff;
+        font-weight: 800;
+        font-size: 13px;
+        padding: 9px 14px;
+        letter-spacing: .02em;
+    }}
+    .infra-node-body {{
+        padding: 12px 14px;
+        color: #10291b;
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+    }}
+    .infra-node-body strong {{
+        font-size: 15px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }}
+    .infra-node-body span, .infra-node-body em {{
+        color: #81909e;
+        font-size: 12px;
+        font-style: normal;
+    }}
+    .infra-map-svg {{
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: {width}px;
+        height: {height}px;
+        z-index: 1;
+        pointer-events: none;
+    }}
+    .infra-edge {{
+        fill: none;
+        stroke: #94a3b8;
+        stroke-width: 2.5;
+        stroke-dasharray: 7 7;
+    }}
+    .infra-edge-label {{
+        fill: #64748b;
+        font-size: 12px;
+        font-family: Arial, sans-serif;
+        paint-order: stroke;
+        stroke: #ffffff;
+        stroke-width: 4px;
+    }}
+    .infra-map-empty {{
+        height: 320px;
+        display: grid;
+        place-items: center;
+        color: #64748b;
+        border: 1px solid #d8e3db;
+        border-radius: 12px;
+        background: #f8fafc;
+    }}
+    </style>
+    <div class='infra-map-wrap'>
+        <svg class='infra-map-svg' viewBox='0 0 {width} {height}' preserveAspectRatio='xMinYMin meet'>
+            <defs>
+                <marker id='arrow' markerWidth='10' markerHeight='10' refX='7' refY='3' orient='auto'>
+                    <path d='M0,0 L0,6 L8,3 z' fill='#94a3b8'></path>
+                </marker>
+            </defs>
+            {''.join(svg_lines)}
+        </svg>
+        {''.join(lane_blocks)}
+        {''.join(card_blocks)}
+    </div>
+    """
+    return html, height
+
+
 def build_code_block(lines):
     """Renderiza un bloque de texto con estilo consistente."""
     if not lines:
@@ -772,15 +2079,7 @@ def init_app():
 
 init_app()
 
-if "theme_name" not in st.session_state:
-    st.session_state["theme_name"] = "Claro"
-
-theme_name = st.sidebar.selectbox(
-    "Tema visual",
-    ["Claro", "Oscuro"],
-    index=0 if st.session_state["theme_name"] == "Claro" else 1,
-)
-st.session_state["theme_name"] = theme_name
+theme_name = "Claro"
 theme = get_theme_palette(theme_name)
 
 st.markdown(
@@ -799,6 +2098,42 @@ st.markdown(
     [data-testid="stSidebar"] {{
         background: {theme["sidebar_bg"]};
         border-right: 1px solid {theme["sidebar_border"]};
+    }}
+    [data-testid="stSidebar"] section {{
+        padding-top: 0;
+    }}
+    [data-testid="stSidebar"] .block-container {{
+        padding-top: 0 !important;
+        margin-top: 0 !important;
+    }}
+    [data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{
+        padding-top: 0 !important;
+        margin-top: 0 !important;
+    }}
+    [data-testid="stSidebar"] [data-testid="stSidebarNav"] {{
+        padding-top: 0;
+    }}
+    [data-testid="stSidebarCollapseButton"] {{
+        top: 0.15rem;
+    }}
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {{
+        gap: 0.55rem;
+    }}
+    [data-testid="stSidebar"] hr {{
+        margin: 0.75rem 0;
+        border-color: {theme["sidebar_border"]};
+    }}
+    [data-testid="stSidebar"] h1 {{
+        font-size: 28px;
+        margin: 0 0 0.45rem 0;
+    }}
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3 {{
+        font-size: 21px;
+        margin: 0.35rem 0 0.2rem 0;
+    }}
+    [data-testid="stSidebar"] label {{
+        margin-bottom: 0.15rem;
     }}
     [data-testid="stSidebar"] * {{
         color: {theme["sidebar_text"]};
@@ -838,6 +2173,16 @@ st.markdown(
         background: {theme["sidebar_panel_bg"]};
         border-color: {theme["sidebar_border"]};
         color: {theme["sidebar_text"]};
+        min-height: 42px;
+        border-radius: 10px;
+    }}
+    [data-testid="stSidebar"] div[role="radiogroup"] {{
+        gap: 0.2rem;
+    }}
+    [data-testid="stSidebar"] div[role="radiogroup"] label {{
+        min-height: 24px;
+        padding-top: 0;
+        padding-bottom: 0;
     }}
     div[data-baseweb="select"] input,
     div[data-baseweb="select"] span,
@@ -902,10 +2247,20 @@ st.markdown(
         background: {theme["sidebar_metric_bg"]};
         border: 1px solid {theme["sidebar_metric_border"]};
         box-shadow: none;
+        border-radius: 12px;
+        padding: 7px 7px;
+        min-height: 74px;
     }}
     [data-testid="stSidebar"] div[data-testid="stMetricLabel"],
     [data-testid="stSidebar"] div[data-testid="stMetricValue"] {{
         color: {theme["sidebar_text"]};
+    }}
+    [data-testid="stSidebar"] div[data-testid="stMetricLabel"] {{
+        font-size: 14px;
+    }}
+    [data-testid="stSidebar"] div[data-testid="stMetricValue"] {{
+        font-size: 28px;
+        line-height: 1.05;
     }}
     [data-testid="stSidebar"] div[data-testid="stMetricDelta"] {{
         color: {theme["sidebar_text"]};
@@ -991,6 +2346,13 @@ st.markdown(
         background: {theme["sidebar_button_bg"]};
         color: {theme["sidebar_button_text"]};
         border: 1px solid {theme["sidebar_border"]};
+        min-height: 42px;
+        width: 100%;
+        padding: 6px 12px;
+        border-radius: 10px;
+        font-size: 15px;
+        font-weight: 700;
+        line-height: 1.25;
     }}
     [data-testid="stSidebar"] .stButton > button:hover,
     [data-testid="stSidebar"] [data-testid="baseButton-secondary"]:hover,
@@ -1004,6 +2366,8 @@ st.markdown(
         border: 1px solid {theme["sidebar_metric_border"]};
         color: {theme["sidebar_text"]};
         box-shadow: none;
+        padding: 0.55rem 0.75rem;
+        min-height: 44px;
     }}
     [data-testid="stSidebar"] div[data-testid="stAlert"] * {{
         color: {theme["sidebar_text"]} !important;
@@ -1119,13 +2483,31 @@ st.sidebar.divider()
 
 page = st.sidebar.radio(
     "Navegacion",
-    ["Dashboard", "Infraestructura AWS", "Comparacion Regional"],
+    [
+        "Dashboard",
+        "Infraestructura AWS",
+        "Productos",
+        "Mapa de Infra",
+        "Tags",
+        "Billing",
+        "Vulnerabilidades",
+        "Comparacion Regional",
+    ],
 )
 
 st.sidebar.divider()
 
-account_names = list(PERFILES.keys())
-selected_account = st.sidebar.selectbox("Cuenta AWS", account_names)
+account_names = [
+    account for account in ACCOUNT_DISPLAY_ORDER if account in PERFILES
+] + [
+    account for account in PERFILES.keys() if account not in ACCOUNT_DISPLAY_ORDER
+]
+account_selector_options = account_names + [ALL_ACCOUNTS_OPTION]
+selected_account = st.sidebar.selectbox(
+    "Cuenta AWS",
+    account_selector_options,
+    format_func=get_account_display_label,
+)
 selected_account_regions = get_region_selector_options(selected_account)
 
 selected_region = st.sidebar.selectbox(
@@ -1140,51 +2522,54 @@ st.sidebar.subheader("Descargas")
 
 excel_output_path = Path("aws_inventory.xlsx")
 excel_download_data = None
-excel_download_name = f"{selected_account}_inventario.xlsx"
+selected_export_accounts = get_selected_account_names(selected_account)
+selected_account_label = get_account_display_label(selected_account)
+excel_download_name = (
+    "inventario_global.xlsx"
+    if selected_account == ALL_ACCOUNTS_OPTION
+    else f"{selected_account}_inventario.xlsx"
+)
 
-col1, col2 = st.sidebar.columns(2)
-with col1:
-    if st.button("Descargar cache", use_container_width=True):
-        with st.spinner("Descargando en paralelo..."):
-            result = download_all_parallel(max_workers=4)
-            if result.get("status") == "failed":
-                st.error(f"Error: {result.get('error', 'Error desconocido')}")
+if st.sidebar.button("Descargar cache", use_container_width=True):
+    with st.spinner("Descargando en paralelo..."):
+        result = download_all_parallel(max_workers=4)
+        if result.get("status") == "failed":
+            st.error(f"Error: {result.get('error', 'Error desconocido')}")
+        else:
+            completed = result.get("completed", 0)
+            failed = result.get("failed", 0)
+            partial = result.get("partial", 0)
+            if failed == 0 and partial == 0:
+                st.success(f"{completed} completadas, {failed} fallidas")
             else:
-                completed = result.get("completed", 0)
-                failed = result.get("failed", 0)
-                partial = result.get("partial", 0)
-                if failed == 0 and partial == 0:
-                    st.success(f"{completed} completadas, {failed} fallidas")
-                else:
-                    st.warning(
-                        f"{completed} completadas, {partial} parciales, {failed} fallidas"
-                    )
+                st.warning(
+                    f"{completed} completadas, {partial} parciales, {failed} fallidas"
+                )
 
-                download_errors = []
-                for detail in result.get("details", []):
-                    for error in detail.get("errors", []):
-                        download_errors.append(f"{detail['account']} / {detail['region']} -> {error}")
+            download_errors = []
+            for detail in result.get("details", []):
+                for error in detail.get("errors", []):
+                    download_errors.append(f"{detail['account']} / {detail['region']} -> {error}")
 
-                if download_errors:
-                    st.caption("Errores detectados durante la descarga")
-                    st.code("\n".join(download_errors[:50]), language=None)
+            if download_errors:
+                st.caption("Errores detectados durante la descarga")
+                st.code("\n".join(download_errors[:50]), language=None)
 
-with col2:
-    if st.button("Descarga .xlsx", use_container_width=True):
-        try:
-            generated_path = export_to_excel(
-                cache_manager,
-                [selected_account],
-                PERFILES,
-                str(excel_output_path),
-            )
-            if generated_path and excel_output_path.exists():
-                excel_download_data = excel_output_path.read_bytes()
-                st.success(f"Excel listo para {selected_account}")
-            else:
-                st.error("No se pudo generar el archivo Excel.")
-        except Exception as exc:
-            st.error(f"Error generando Excel: {exc}")
+if st.sidebar.button("Descarga .xlsx", use_container_width=True):
+    try:
+        generated_path = export_to_excel(
+            cache_manager,
+            selected_export_accounts,
+            PERFILES,
+            str(excel_output_path),
+        )
+        if generated_path and excel_output_path.exists():
+            excel_download_data = excel_output_path.read_bytes()
+            st.success(f"Excel listo para {selected_account_label}")
+        else:
+            st.error("No se pudo generar el archivo Excel.")
+    except Exception as exc:
+        st.error(f"Error generando Excel: {exc}")
 
 if st.sidebar.button("Descarga .xlsx total", use_container_width=True):
     try:
@@ -1236,7 +2621,7 @@ if page == "Dashboard":
     tab1, tab2 = st.tabs(["Cuenta Actual", "Todas las Cuentas"])
 
     with tab1:
-        st.subheader(f"Cuenta: {selected_account} | Vista: {selected_region_label}")
+        st.subheader(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
         if selected_region == ALL_REGIONS_OPTION:
             st.caption("Resumen consolidado de todas las regiones descubiertas y cacheadas para la cuenta.")
 
@@ -1250,13 +2635,30 @@ if page == "Dashboard":
             count = len(service_df) if exists and isinstance(service_df, pd.DataFrame) else 0
             metrics_data[display_name] = (count, status)
 
-        cols = st.columns(4)
-        for idx, (display_name, (count, status)) in enumerate(metrics_data.items()):
-            with cols[idx % 4]:
+        total_components = sum(count for count, _ in metrics_data.values())
+        dashboard_metrics = {
+            "Total componentes": (total_components, selected_region_label),
+            **metrics_data,
+        }
+
+        cols = st.columns(5)
+        for idx, (display_name, (count, status)) in enumerate(dashboard_metrics.items()):
+            with cols[idx % 5]:
                 st.metric(display_name, count, delta=status)
 
         if selected_region == ALL_REGIONS_OPTION:
-            region_summary_df = build_account_region_summary(selected_account)
+            if selected_account == ALL_ACCOUNTS_OPTION:
+                region_summary_frames = [
+                    build_account_region_summary(account)
+                    for account in get_selected_account_names(selected_account)
+                ]
+                region_summary_df = (
+                    pd.concat(region_summary_frames, ignore_index=True)
+                    if region_summary_frames
+                    else pd.DataFrame()
+                )
+            else:
+                region_summary_df = build_account_region_summary(selected_account)
             if not region_summary_df.empty:
                 st.subheader("Cobertura por Region")
                 display_region_summary_df = sanitize_dataframe_for_display(region_summary_df)
@@ -1294,6 +2696,7 @@ if page == "Dashboard":
             "DynamoDB": 0,
             "SQS": 0,
             "IAM": 0,
+            "Total componentes": 0,
         }
 
         account_data = []
@@ -1314,6 +2717,7 @@ if page == "Dashboard":
                 "DynamoDB": 0,
                 "SQS": 0,
                 "IAM": 0,
+                "Total componentes": 0,
             }
 
             regional_services = [
@@ -1342,6 +2746,9 @@ if page == "Dashboard":
                 if exists and isinstance(data, pd.DataFrame):
                     acc_data[key] = len(data)
 
+            acc_data["Total componentes"] = sum(
+                value for key, value in acc_data.items() if key != "Cuenta"
+            )
             account_data.append(acc_data)
 
         for acc_data in account_data:
@@ -1350,37 +2757,37 @@ if page == "Dashboard":
 
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
+            st.metric("Total componentes", totals["Total componentes"])
+        with col2:
             st.metric("EC2", totals["EC2"])
-        with col2:
+        with col3:
             st.metric("RDS", totals["RDS"])
-        with col3:
+        with col4:
             st.metric("VPC", totals["VPC"])
-        with col4:
+        with col5:
             st.metric("S3", totals["S3"])
-        with col5:
+
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
             st.metric("Lambda", totals["Lambda"])
-
-        col1, col2, col3, col4, col5 = st.columns(5)
-        with col1:
+        with col2:
             st.metric("API GW", totals["API"])
-        with col2:
-            st.metric("CloudFormation", totals["CloudFormation"])
         with col3:
-            st.metric("SSM", totals["SSM"])
+            st.metric("CloudFormation", totals["CloudFormation"])
         with col4:
-            st.metric("KMS", totals["KMS"])
+            st.metric("SSM", totals["SSM"])
         with col5:
-            st.metric("DynamoDB", totals["DynamoDB"])
+            st.metric("KMS", totals["KMS"])
 
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
-            st.metric("SQS", totals["SQS"])
+            st.metric("DynamoDB", totals["DynamoDB"])
         with col2:
-            st.metric("NAT/IPs", totals["NAT/IPs"])
+            st.metric("SQS", totals["SQS"])
         with col3:
-            st.metric("IAM", totals["IAM"])
+            st.metric("NAT/IPs", totals["NAT/IPs"])
         with col4:
-            st.empty()
+            st.metric("IAM", totals["IAM"])
         with col5:
             st.empty()
 
@@ -1449,7 +2856,7 @@ elif page == "Infraestructura AWS":
         elif len(data) == 0:
             st.warning(f"La busqueda no retorno resultados para {resource_type}.")
         else:
-            scope_text = f"{selected_account} | {selected_region_label}"
+            scope_text = f"{selected_account_label} | {selected_region_label}"
             st.markdown(
                 build_resource_summary_card(resource_type, len(data), f"{freshness} | {scope_text}"),
                 unsafe_allow_html=True,
@@ -1457,38 +2864,97 @@ elif page == "Infraestructura AWS":
 
             st.subheader("Datos")
             display_data = sanitize_dataframe_for_display(data)
+            display_data = ensure_monitoring_alert_columns(display_data)
             if "region" in display_data.columns:
                 display_data["region"] = display_data["region"].map(get_region_display_label)
 
-            styled_display_data = (
-                display_data.style
-                .set_properties(
-                    **{
-                        "background-color": theme["panel_bg"],
-                        "color": theme["text"],
-                        "border-color": theme["border"],
+            if cache_key == "vpc_outbound_ips":
+                ip_display_df = display_data.copy()
+                for column in [
+                    "state",
+                    "type",
+                    "name",
+                    "allocation_id",
+                    "instance_id",
+                    "network_interface_id",
+                    "public_ip",
+                    "private_ip",
+                    "vpc_id",
+                    "subnet_id",
+                    "region",
+                ]:
+                    if column not in ip_display_df.columns:
+                        ip_display_df[column] = ""
+                ip_display_df["Estado"] = ip_display_df["state"].map(
+                    {
+                        "associated": "Asociada",
+                        "available": "Disponible",
+                        "pending": "Pendiente",
+                        "failed": "Fallida",
+                        "deleted": "Eliminada",
+                        "deleting": "Eliminando",
+                        "detached": "Sin asociar",
+                        "attached": "Asociada",
                     }
+                ).fillna(ip_display_df["state"])
+                ip_display_df["Tipo"] = ip_display_df["type"]
+                ip_display_df["Nombre"] = ip_display_df["name"]
+                ip_display_df["ID Asignacion"] = ip_display_df["allocation_id"]
+                ip_display_df["ID Instancia"] = ip_display_df["instance_id"]
+                ip_display_df["ID Interfaz (ENI)"] = ip_display_df["network_interface_id"]
+                ip_display_df["IP Publica"] = ip_display_df["public_ip"]
+                ip_display_df["IP Privada"] = ip_display_df["private_ip"]
+                ip_display_df["VPC"] = ip_display_df["vpc_id"]
+                ip_display_df["Subnet"] = ip_display_df["subnet_id"]
+                ip_display_df["Region"] = ip_display_df["region"]
+                preferred_ip_columns = [
+                    "Estado",
+                    "Tipo",
+                    "Nombre",
+                    "ID Asignacion",
+                    "ID Instancia",
+                    "ID Interfaz (ENI)",
+                    "IP Publica",
+                    "IP Privada",
+                    "VPC",
+                    "Subnet",
+                    "Region",
+                ]
+                st.dataframe(
+                    ip_display_df[preferred_ip_columns],
+                    use_container_width=True,
+                    hide_index=True,
                 )
-                .set_table_styles(
-                    [
-                        {
-                            "selector": "th",
-                            "props": [
-                                ("background-color", theme["table_header"]),
-                                ("color", theme["text"]),
-                                ("border-color", theme["border"]),
-                            ],
-                        },
-                        {
-                            "selector": "td",
-                            "props": [
-                                ("border-color", theme["border"]),
-                            ],
-                        },
-                    ]
+            else:
+                styled_display_data = (
+                    display_data.style
+                    .set_properties(
+                        **{
+                            "background-color": theme["panel_bg"],
+                            "color": theme["text"],
+                            "border-color": theme["border"],
+                        }
+                    )
+                    .set_table_styles(
+                        [
+                            {
+                                "selector": "th",
+                                "props": [
+                                    ("background-color", theme["table_header"]),
+                                    ("color", theme["text"]),
+                                    ("border-color", theme["border"]),
+                                ],
+                            },
+                            {
+                                "selector": "td",
+                                "props": [
+                                    ("border-color", theme["border"]),
+                                ],
+                            },
+                        ]
+                    )
                 )
-            )
-            st.dataframe(styled_display_data, use_container_width=True)
+                st.dataframe(styled_display_data, use_container_width=True)
 
             if selected_region == ALL_REGIONS_OPTION and "region" in display_data.columns:
                 st.subheader("Distribucion por Region")
@@ -1604,7 +3070,431 @@ elif page == "Infraestructura AWS":
     except Exception as exc:
         st.error(f"Error procesando datos: {str(exc)}")
 
-else:
+elif page == "Productos":
+    st.title("Productos")
+    st.caption(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
+    st.caption(
+        "Agrupacion sugerida de recursos basada en tags, patrones de nombre y relaciones detectadas."
+    )
+
+    product_df = build_product_inventory_dataframe(selected_account, selected_region)
+    relationships_df = build_product_relationships_dataframe(selected_account, selected_region)
+    summary_df = build_product_summary_dataframe(product_df, relationships_df)
+
+    total_products = len(summary_df)
+    total_resources = int(summary_df["Recursos"].sum()) if not summary_df.empty else 0
+    total_relationships = int(summary_df["Relaciones"].sum()) if not summary_df.empty else 0
+    high_confidence = int((summary_df["Confianza"] == "Alta").sum()) if not summary_df.empty else 0
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Productos sugeridos", total_products)
+    with col2:
+        st.metric("Recursos agrupados", total_resources)
+    with col3:
+        st.metric("Relaciones", total_relationships)
+    with col4:
+        st.metric("Confianza alta", high_confidence)
+
+    if summary_df.empty:
+        st.warning("No hay suficiente informacion cacheada para sugerir productos en este alcance.")
+    else:
+        st.subheader("Auto-deteccion de productos")
+        display_summary_df = sanitize_dataframe_for_display(summary_df.drop(columns=["Producto key"], errors="ignore"))
+        st.dataframe(display_summary_df, use_container_width=True, hide_index=True)
+
+        service_rows = []
+        for _, summary_row in summary_df.iterrows():
+            product_key = summary_row["Producto key"]
+            product_resources = product_df[product_df["Producto key"] == product_key]
+            if product_resources.empty:
+                continue
+            for service_name, amount in product_resources["Servicio"].value_counts().items():
+                service_rows.append(
+                    {
+                        "Producto": summary_row["Producto"],
+                        "Servicio": service_name,
+                        "Cantidad": int(amount),
+                    }
+                )
+
+        service_chart_df = pd.DataFrame(service_rows)
+        if not service_chart_df.empty:
+            fig = px.bar(
+                service_chart_df,
+                x="Producto",
+                y="Cantidad",
+                color="Servicio",
+                barmode="stack",
+                title="Recursos por producto y servicio",
+            )
+            fig = style_plotly_figure(fig, theme_name)
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Detalle por producto")
+        for _, summary_row in summary_df.iterrows():
+            product_key = summary_row["Producto key"]
+            product_resources = product_df[product_df["Producto key"] == product_key]
+            product_relationships = relationships_df[
+                relationships_df["Producto key"] == product_key
+            ] if not relationships_df.empty else pd.DataFrame()
+            expander_title = (
+                f"{summary_row['Producto']} | "
+                f"{summary_row['Recursos']} recursos | "
+                f"{summary_row['Relaciones']} relaciones | "
+                f"{summary_row['Confianza']}"
+            )
+
+            with st.expander(expander_title, expanded=False):
+                metric_col1, metric_col2, metric_col3 = st.columns(3)
+                with metric_col1:
+                    st.metric("Recursos", int(summary_row["Recursos"]))
+                with metric_col2:
+                    st.metric("Relaciones", int(summary_row["Relaciones"]))
+                with metric_col3:
+                    st.metric("Confianza", summary_row["Confianza"])
+
+                st.caption(f"Servicios detectados: {summary_row['Servicios']}")
+
+                if not product_resources.empty:
+                    st.markdown("**Recursos asociados**")
+                    resources_display_df = sanitize_dataframe_for_display(
+                        product_resources.drop(columns=["Producto key"], errors="ignore")
+                    )
+                    if "Region" in resources_display_df.columns:
+                        resources_display_df["Region"] = resources_display_df["Region"].map(
+                            get_region_display_label
+                        )
+                    st.dataframe(resources_display_df, use_container_width=True, hide_index=True)
+
+                if not product_relationships.empty:
+                    st.markdown("**Relaciones detectadas**")
+                    relationship_display_df = sanitize_dataframe_for_display(
+                        product_relationships.drop(columns=["Producto key"], errors="ignore")
+                    )
+                    if "Region" in relationship_display_df.columns:
+                        relationship_display_df["Region"] = relationship_display_df["Region"].map(
+                            get_region_display_label
+                        )
+                    st.dataframe(relationship_display_df, use_container_width=True, hide_index=True)
+
+elif page == "Mapa de Infra":
+    st.title("Mapa de Infraestructura")
+    st.caption(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
+    st.caption("MVP de red por producto basado en recursos y relaciones detectadas desde cache.")
+
+    product_df = build_product_inventory_dataframe(selected_account, selected_region)
+    relationships_df = build_product_relationships_dataframe(selected_account, selected_region)
+    summary_df = build_product_summary_dataframe(product_df, relationships_df)
+
+    if summary_df.empty:
+        st.warning("No hay productos detectados para construir el mapa. Descarga cache o revisa el modulo Productos.")
+    else:
+        map_col1, map_col2, map_col3 = st.columns([2, 2, 1])
+        product_options = summary_df["Producto key"].tolist()
+        product_labels = dict(zip(summary_df["Producto key"], summary_df["Producto"]))
+        with map_col1:
+            selected_product_key = st.selectbox(
+                "Producto",
+                product_options,
+                format_func=lambda key: product_labels.get(key, key),
+            )
+
+        selected_product_resources = product_df[
+            product_df["Producto key"] == selected_product_key
+        ] if not product_df.empty else pd.DataFrame()
+        service_options = ["Todos los servicios"]
+        if not selected_product_resources.empty:
+            service_options.extend(sorted(selected_product_resources["Servicio"].dropna().unique()))
+
+        with map_col2:
+            selected_map_service = st.selectbox("Servicio", service_options)
+        with map_col3:
+            max_map_nodes = st.number_input("Max nodos", min_value=10, max_value=120, value=60, step=10)
+
+        nodes, edges = build_infra_map(
+            product_df,
+            relationships_df,
+            selected_product_key,
+            service_filter=selected_map_service,
+            max_nodes=int(max_map_nodes),
+        )
+        service_count = len({node["service"] for node in nodes})
+        product_name = product_labels.get(selected_product_key, selected_product_key)
+
+        metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+        with metric_col1:
+            st.metric("Producto", product_name)
+        with metric_col2:
+            st.metric("Recursos", len(nodes))
+        with metric_col3:
+            st.metric("Relaciones", len(edges))
+        with metric_col4:
+            st.metric("Servicios", service_count)
+
+        map_html, map_height = render_infra_map_html(nodes, edges)
+        components.html(map_html, height=min(max(map_height + 20, 520), 1400), scrolling=True)
+
+        with st.expander("Datos del mapa", expanded=False):
+            tab_nodes, tab_edges = st.tabs(["Nodos", "Relaciones"])
+            with tab_nodes:
+                nodes_df = pd.DataFrame(nodes)
+                if not nodes_df.empty:
+                    st.dataframe(
+                        sanitize_dataframe_for_display(nodes_df.drop(columns=["id"], errors="ignore")),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+            with tab_edges:
+                edges_df = pd.DataFrame(edges)
+                if not edges_df.empty:
+                    st.dataframe(
+                        sanitize_dataframe_for_display(edges_df),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.info("No se detectaron relaciones para este producto/filtro.")
+
+elif page == "Tags":
+    st.title("Tags")
+    st.caption(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
+    st.caption("Tags obligatorios evaluados: " + ", ".join(MANDATORY_TAGS))
+
+    tags_df = build_tag_compliance_dataframe(selected_account, selected_region)
+    if tags_df.empty:
+        st.warning("No hay recursos cacheados para analizar tags en este alcance.")
+    else:
+        total_resources = len(tags_df)
+        compliant = int(tags_df["Cumple tags"].sum())
+        missing = total_resources - compliant
+        evidence_missing = int((tags_df["Evidencia disponible"] == "No").sum())
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Recursos analizados", total_resources)
+        with col2:
+            st.metric("Cumplen tags", compliant)
+        with col3:
+            st.metric("Con brecha", missing)
+        with col4:
+            st.metric("Sin evidencia en cache", evidence_missing)
+
+        summary_df = (
+            tags_df.groupby(["Servicio", "Estado tags"], dropna=False)
+            .size()
+            .reset_index(name="Cantidad")
+        )
+        fig = px.bar(
+            summary_df,
+            x="Servicio",
+            y="Cantidad",
+            color="Estado tags",
+            barmode="stack",
+            title="Cumplimiento de tags por servicio",
+        )
+        fig = style_plotly_figure(fig, theme_name)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Detalle de tags")
+        display_df = sanitize_dataframe_for_display(tags_df)
+        display_df["Region"] = display_df["Region"].map(get_region_display_label)
+        preferred_tag_columns = [
+            "Cuenta",
+            "Region",
+            "Servicio",
+            "Recurso",
+            "Estado tags",
+            "Tags obligatorios presentes",
+            "Tag Name",
+            "Tag Environment",
+            "Tag Owner",
+            "Tag CostCenter",
+            "Tag Application",
+            "Tags presentes",
+            "Tags faltantes",
+            "Evidencia disponible",
+        ]
+        display_df = display_df[
+            [column for column in preferred_tag_columns if column in display_df.columns]
+            + [column for column in display_df.columns if column not in preferred_tag_columns and column != "Cumple tags"]
+        ]
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+elif page == "Billing":
+    st.title("Billing")
+    st.caption(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
+
+    recommendations_df = build_billing_recommendations_dataframe(selected_account, selected_region)
+    high_count = int((recommendations_df["Prioridad"] == "Alta").sum()) if not recommendations_df.empty else 0
+    medium_count = int((recommendations_df["Prioridad"] == "Media").sum()) if not recommendations_df.empty else 0
+    low_count = int((recommendations_df["Prioridad"] == "Baja").sum()) if not recommendations_df.empty else 0
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Hallazgos FinOps", len(recommendations_df))
+    with col2:
+        st.metric("Alta prioridad", high_count)
+    with col3:
+        st.metric("Media prioridad", medium_count)
+    with col4:
+        st.metric("Baja prioridad", low_count)
+
+    st.subheader("Cost Explorer")
+    st.caption("Consulta los ultimos meses por servicio y region. Requiere permisos ce:GetCostAndUsage.")
+    cost_state_key = f"cost_explorer_{selected_account}"
+    if st.button("Consultar Cost Explorer", use_container_width=False):
+        try:
+            with st.spinner("Consultando Cost Explorer..."):
+                cost_df = fetch_cost_explorer_dataframe(selected_account)
+            if cost_df.empty:
+                st.info("Cost Explorer no retorno costos para la cuenta seleccionada.")
+            else:
+                st.session_state[cost_state_key] = cost_df
+                st.success("Costos actualizados desde Cost Explorer.")
+        except Exception as exc:
+            st.warning(f"No se pudo consultar Cost Explorer: {exc}")
+
+    cached_cost_df = st.session_state.get(cost_state_key, pd.DataFrame())
+    scoped_cost_df = filter_costs_by_selected_scope(cached_cost_df, selected_region)
+    if cached_cost_df.empty:
+        st.info("Consulta Cost Explorer para ver KPIs, graficos y costo por producto.")
+    else:
+        metrics = build_cost_dashboard_metrics(scoped_cost_df)
+        month_label = metrics["current_month"] or "Sin mes"
+        metric_col1, metric_col2, metric_col3 = st.columns(3)
+        with metric_col1:
+            st.metric(f"Total mes actual ({month_label})", f"${metrics['current_total']:,.2f}")
+        with metric_col2:
+            st.metric("Variacion vs. mes anterior", f"{metrics['variation_pct']:.1f}%")
+        with metric_col3:
+            st.metric("Servicios activos", metrics["active_services"])
+
+        service_cost_df = build_cost_by_service_dataframe(scoped_cost_df)
+        if not service_cost_df.empty:
+            st.subheader("Costo por servicio")
+            chart_df = service_cost_df.head(20).sort_values("Costo USD", ascending=True)
+            fig = px.bar(
+                chart_df,
+                x="Costo USD",
+                y="Servicio",
+                orientation="h",
+                title="Top servicios por costo mensual",
+                color="Costo USD",
+            )
+            fig = style_plotly_figure(fig, theme_name)
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.dataframe(
+                sanitize_dataframe_for_display(service_cost_df),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Costo USD": st.column_config.NumberColumn("Costo USD", format="$%.2f"),
+                    "% del Total": st.column_config.NumberColumn("% del Total", format="%.1f%%"),
+                },
+            )
+
+        current_cost_df = get_current_month_costs(scoped_cost_df)
+        if not current_cost_df.empty:
+            region_cost_df = (
+                current_cost_df.groupby("Region", as_index=False)["Costo USD"]
+                .sum()
+                .sort_values("Costo USD", ascending=False)
+            )
+            st.subheader("Costo por region")
+            fig = px.bar(
+                region_cost_df,
+                x="Region",
+                y="Costo USD",
+                title="Distribucion mensual por region",
+                color="Costo USD",
+            )
+            fig = style_plotly_figure(fig, theme_name)
+            st.plotly_chart(fig, use_container_width=True)
+
+        product_cost_df = build_estimated_product_cost_dataframe(
+            selected_account,
+            selected_region,
+            cached_cost_df,
+        )
+        if not product_cost_df.empty:
+            st.subheader("Costo por producto")
+            st.caption(
+                "Estimacion basada en los productos detectados y distribucion proporcional de costos por servicio. "
+                "Para precision contable, conviene habilitar cost allocation tags por producto."
+            )
+            st.dataframe(
+                sanitize_dataframe_for_display(product_cost_df),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Costo Mensual USD": st.column_config.NumberColumn("Costo Mensual", format="$%.2f"),
+                    "% del Total": st.column_config.NumberColumn("% del Total", format="%.1f%%"),
+                },
+            )
+
+    st.subheader("Oportunidades desde inventario")
+    if recommendations_df.empty:
+        st.success("No se detectaron oportunidades FinOps con la informacion cacheada actual.")
+    else:
+        st.dataframe(
+            sanitize_dataframe_for_display(recommendations_df),
+            use_container_width=True,
+            hide_index=True,
+        )
+        by_service = recommendations_df.groupby(["Servicio", "Prioridad"]).size().reset_index(name="Cantidad")
+        fig = px.bar(
+            by_service,
+            x="Servicio",
+            y="Cantidad",
+            color="Prioridad",
+            barmode="stack",
+            title="Hallazgos FinOps por servicio",
+        )
+        fig = style_plotly_figure(fig, theme_name)
+        st.plotly_chart(fig, use_container_width=True)
+
+elif page == "Vulnerabilidades":
+    st.title("Vulnerabilidades")
+    st.caption(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
+
+    vulnerability_df = build_vulnerability_dataframe(selected_account, selected_region)
+    high_count = int((vulnerability_df["Prioridad"] == "Alta").sum()) if not vulnerability_df.empty else 0
+    medium_count = int((vulnerability_df["Prioridad"] == "Media").sum()) if not vulnerability_df.empty else 0
+    by_service_count = vulnerability_df["Servicio"].nunique() if not vulnerability_df.empty else 0
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Hallazgos", len(vulnerability_df))
+    with col2:
+        st.metric("Alta prioridad", high_count)
+    with col3:
+        st.metric("Media prioridad", medium_count)
+    with col4:
+        st.metric("Servicios afectados", by_service_count)
+
+    if vulnerability_df.empty:
+        st.success("No se detectaron hallazgos con la informacion cacheada actual.")
+    else:
+        st.subheader("Detalle de vulnerabilidades y brechas")
+        display_df = sanitize_dataframe_for_display(vulnerability_df)
+        display_df["Region"] = display_df["Region"].map(get_region_display_label)
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        summary_df = vulnerability_df.groupby(["Servicio", "Prioridad"]).size().reset_index(name="Cantidad")
+        fig = px.bar(
+            summary_df,
+            x="Servicio",
+            y="Cantidad",
+            color="Prioridad",
+            barmode="stack",
+            title="Hallazgos por servicio",
+        )
+        fig = style_plotly_figure(fig, theme_name)
+        st.plotly_chart(fig, use_container_width=True)
+
+elif page == "Comparacion Regional":
     target_account = REGIONAL_COMPARISON_TARGET["account"]
     left_region = REGIONAL_COMPARISON_TARGET["left_region"]
     right_region = REGIONAL_COMPARISON_TARGET["right_region"]
