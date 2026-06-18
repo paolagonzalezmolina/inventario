@@ -256,6 +256,176 @@ def add_audit_metadata(perfil, region, resource_type, data):
     return enriched
 
 
+def _get_alarm_lookup_values(resource_type, row):
+    """Retorna dimensiones CloudWatch candidatas para asociar alarmas a recursos."""
+    candidates = {
+        "ec2": {
+            "InstanceId": [row.get("id")],
+        },
+        "rds": {
+            "DBInstanceIdentifier": [row.get("id"), row.get("nombre")],
+        },
+        "lambda": {
+            "FunctionName": [row.get("nombre")],
+        },
+        "dynamodb": {
+            "TableName": [row.get("nombre")],
+        },
+        "sqs": {
+            "QueueName": [row.get("nombre")],
+        },
+        "api_gateway": {
+            "ApiId": [row.get("id")],
+            "ApiName": [row.get("nombre")],
+        },
+        "api_gateway_routes": {
+            "ApiId": [row.get("api_id")],
+            "ApiName": [row.get("api_nombre")],
+            "FunctionName": [row.get("lambda_function")],
+        },
+        "vpc_outbound_ips": {
+            "NatGatewayId": [row.get("resource_id")],
+            "AllocationId": [row.get("allocation_id")],
+        },
+    }
+
+    lookup = {}
+    for dimension_name, values in candidates.get(resource_type, {}).items():
+        clean_values = {
+            str(value).strip()
+            for value in values
+            if value is not None and str(value).strip()
+        }
+        if clean_values:
+            lookup[dimension_name] = clean_values
+    return lookup
+
+
+def _alarm_matches_resource(alarm, lookup_values):
+    """Determina si una alarma CloudWatch aplica al recurso por dimensiones."""
+    if not lookup_values:
+        return False
+    dimensions = alarm.get("Dimensions") or []
+    for dimension in dimensions:
+        name = dimension.get("Name")
+        value = str(dimension.get("Value", "")).strip()
+        if name in lookup_values and value in lookup_values[name]:
+            return True
+    return False
+
+
+def _list_cloudwatch_alarms(profile_name, region):
+    """Lista alarmas CloudWatch de una region."""
+    client = _get_client(profile_name, "cloudwatch", region)
+    if not client:
+        return []
+
+    alarms = []
+    try:
+        paginator = client.get_paginator("describe_alarms")
+        for page in paginator.paginate():
+            alarms.extend(page.get("MetricAlarms", []))
+    except Exception as exc:
+        logger.warning(f"No se pudieron consultar alarmas CloudWatch en {region}: {exc}")
+    return alarms
+
+
+def _get_sns_email_subscriptions(profile_name, region, topic_arn, subscription_cache):
+    """Obtiene correos suscritos a un topic SNS usado por alarmas."""
+    if not topic_arn or ":sns:" not in str(topic_arn):
+        return []
+    if topic_arn in subscription_cache:
+        return subscription_cache[topic_arn]
+
+    sns_region = str(topic_arn).split(":")[3] if len(str(topic_arn).split(":")) > 3 else region
+    client = _get_client(profile_name, "sns", sns_region)
+    emails = []
+    if client:
+        try:
+            paginator = client.get_paginator("list_subscriptions_by_topic")
+            for page in paginator.paginate(TopicArn=topic_arn):
+                for subscription in page.get("Subscriptions", []):
+                    protocol = subscription.get("Protocol")
+                    endpoint = subscription.get("Endpoint")
+                    if protocol in {"email", "email-json"} and endpoint:
+                        emails.append(endpoint)
+        except Exception as exc:
+            logger.warning(f"No se pudieron consultar suscripciones SNS {topic_arn}: {exc}")
+
+    subscription_cache[topic_arn] = emails
+    return emails
+
+
+def add_monitoring_alerts_metadata(perfil, region, resource_type, data):
+    """Agrega columnas que indican si el recurso tiene alarmas CloudWatch y correo."""
+    if data is None or not isinstance(data, pd.DataFrame) or data.empty:
+        return data
+
+    alarms = _list_cloudwatch_alarms(perfil, region)
+    if not alarms:
+        enriched = data.copy()
+        enriched["alertas_configuradas"] = "No"
+        enriched["alertas_count"] = 0
+        enriched["alertas_nombres"] = ""
+        enriched["alertas_metricas"] = ""
+        enriched["alertas_acciones"] = ""
+        enriched["alertas_email_configurado"] = "No"
+        enriched["alertas_emails"] = ""
+        return enriched
+
+    enriched = data.copy()
+    subscription_cache = {}
+    monitoring_rows = []
+
+    for _, row in enriched.iterrows():
+        row_dict = row.to_dict()
+        lookup_values = _get_alarm_lookup_values(resource_type, row_dict)
+        matched_alarms = [
+            alarm for alarm in alarms if _alarm_matches_resource(alarm, lookup_values)
+        ]
+
+        alarm_names = []
+        alarm_metrics = []
+        alarm_actions = []
+        alarm_emails = []
+
+        for alarm in matched_alarms:
+            if alarm.get("AlarmName"):
+                alarm_names.append(alarm.get("AlarmName"))
+            metric_name = alarm.get("MetricName")
+            namespace = alarm.get("Namespace")
+            if metric_name:
+                alarm_metrics.append(f"{namespace}/{metric_name}" if namespace else metric_name)
+
+            actions = []
+            actions.extend(alarm.get("AlarmActions") or [])
+            actions.extend(alarm.get("OKActions") or [])
+            actions.extend(alarm.get("InsufficientDataActions") or [])
+            for action in actions:
+                if action and action not in alarm_actions:
+                    alarm_actions.append(action)
+                for email in _get_sns_email_subscriptions(perfil, region, action, subscription_cache):
+                    if email not in alarm_emails:
+                        alarm_emails.append(email)
+
+        monitoring_rows.append(
+            {
+                "alertas_configuradas": "Si" if matched_alarms else "No",
+                "alertas_count": len(matched_alarms),
+                "alertas_nombres": _compact_join(alarm_names),
+                "alertas_metricas": _compact_join(alarm_metrics),
+                "alertas_acciones": _compact_join(alarm_actions),
+                "alertas_email_configurado": "Si" if alarm_emails else "No",
+                "alertas_emails": _compact_join(alarm_emails),
+            }
+        )
+
+    monitoring_df = pd.DataFrame(monitoring_rows, index=enriched.index)
+    for column in monitoring_df.columns:
+        enriched[column] = monitoring_df[column]
+    return enriched
+
+
 def _get_session(profile_name):
     """Crea una sesion de boto3 con perfil especifico."""
     try:
@@ -1097,6 +1267,7 @@ def get_vpc_outbound_ips_df(perfil, region):
                             "private_ip": "",
                             "allocation_id": "",
                             "network_interface_id": "",
+                            "instance_id": "",
                             "state": nat.get("State"),
                             "connectivity_type": nat.get("ConnectivityType", "public"),
                             "region": region,
@@ -1114,6 +1285,7 @@ def get_vpc_outbound_ips_df(perfil, region):
                             "private_ip": addr.get("PrivateIp") or "",
                             "allocation_id": addr.get("AllocationId") or "",
                             "network_interface_id": addr.get("NetworkInterfaceId") or "",
+                            "instance_id": "",
                             "state": nat.get("State"),
                             "connectivity_type": nat.get("ConnectivityType", "public"),
                             "region": region,
@@ -1141,6 +1313,7 @@ def get_vpc_outbound_ips_df(perfil, region):
                     "private_ip": addr.get("PrivateIpAddress") or "",
                     "allocation_id": allocation_id,
                     "network_interface_id": addr.get("NetworkInterfaceId") or "",
+                    "instance_id": addr.get("InstanceId") or "",
                     "state": "associated" if addr.get("AssociationId") else "available",
                     "connectivity_type": "public",
                     "region": region,
@@ -1165,6 +1338,7 @@ def get_vpc_outbound_ips_df(perfil, region):
                         "private_ip": "",
                         "allocation_id": "",
                         "network_interface_id": "",
+                        "instance_id": "",
                         "state": "detached",
                         "connectivity_type": "public",
                         "region": region,
@@ -1182,6 +1356,7 @@ def get_vpc_outbound_ips_df(perfil, region):
                         "private_ip": "",
                         "allocation_id": "",
                         "network_interface_id": "",
+                        "instance_id": "",
                         "state": att.get("State", "unknown"),
                         "connectivity_type": "public",
                         "region": region,

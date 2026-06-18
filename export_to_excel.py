@@ -53,7 +53,11 @@ SERVICE_EXPORT_CONFIG = [
         "sheet_name": "NAT_IPs",
         "summary_label": "NAT/IPs",
         "global_service": False,
-        "preferred_columns": ["cuenta", "region", "type", "name", "resource_id", "public_ip", "private_ip", "vpc_id", "subnet_id", "state"],
+        "preferred_columns": [
+            "cuenta", "region", "type", "name", "resource_id", "allocation_id",
+            "instance_id", "network_interface_id", "public_ip", "private_ip",
+            "vpc_id", "subnet_id", "state"
+        ],
     },
     {
         "cache_key": "s3",
