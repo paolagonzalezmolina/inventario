@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 import boto3
 import pandas as pd
+from botocore.exceptions import ClientError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -468,6 +469,162 @@ def _compact_join(values, separator="; "):
     return separator.join(unique_values)
 
 
+def _aws_error_code(exc):
+    if isinstance(exc, ClientError):
+        return exc.response.get("Error", {}).get("Code")
+    return None
+
+
+def _s3_public_access_block_status(s3, bucket_name):
+    """Resume la configuracion de bloqueo publico de un bucket."""
+    try:
+        config = s3.get_public_access_block(Bucket=bucket_name).get("PublicAccessBlockConfiguration", {})
+    except Exception as exc:
+        if _aws_error_code(exc) == "NoSuchPublicAccessBlockConfiguration":
+            return "No", ""
+        return "No disponible", "No disponible"
+
+    controls = [
+        "BlockPublicAcls",
+        "IgnorePublicAcls",
+        "BlockPublicPolicy",
+        "RestrictPublicBuckets",
+    ]
+    enabled = [control for control in controls if config.get(control)]
+    if len(enabled) == len(controls):
+        return "Si", _compact_join(enabled)
+    if enabled:
+        return "Parcial", _compact_join(enabled)
+    return "No", ""
+
+
+def _s3_bucket_policy_public_status(s3, bucket_name):
+    """Indica si AWS detecta una policy publica para el bucket."""
+    try:
+        policy_status = s3.get_bucket_policy_status(Bucket=bucket_name).get("PolicyStatus", {})
+        return "Si" if policy_status.get("IsPublic") else "No"
+    except Exception as exc:
+        if _aws_error_code(exc) in {"NoSuchBucketPolicy", "NoSuchBucket"}:
+            return "No"
+        return "No disponible"
+
+
+def _s3_acl_public_status(s3, bucket_name):
+    """Detecta grants ACL publicos hacia grupos globales de S3."""
+    public_groups = {
+        "http://acs.amazonaws.com/groups/global/AllUsers",
+        "http://acs.amazonaws.com/groups/global/AuthenticatedUsers",
+    }
+    try:
+        acl = s3.get_bucket_acl(Bucket=bucket_name)
+    except Exception:
+        return "No disponible", ""
+
+    public_grants = []
+    for grant in acl.get("Grants", []):
+        grantee = grant.get("Grantee", {}) or {}
+        if grantee.get("URI") in public_groups:
+            permission = grant.get("Permission", "")
+            display_name = "AllUsers" if grantee.get("URI", "").endswith("AllUsers") else "AuthenticatedUsers"
+            public_grants.append(f"{display_name}:{permission}")
+
+    return ("Si" if public_grants else "No"), _compact_join(public_grants)
+
+
+def _s3_bucket_encryption_status(s3, bucket_name):
+    """Resume si el bucket declara cifrado por defecto."""
+    try:
+        encryption = s3.get_bucket_encryption(Bucket=bucket_name)
+    except Exception as exc:
+        if _aws_error_code(exc) == "ServerSideEncryptionConfigurationNotFoundError":
+            return "No", ""
+        return "No disponible", ""
+
+    rules = encryption.get("ServerSideEncryptionConfiguration", {}).get("Rules", [])
+    algorithms = []
+    for rule in rules:
+        default_encryption = rule.get("ApplyServerSideEncryptionByDefault", {}) or {}
+        algorithm = default_encryption.get("SSEAlgorithm")
+        kms_key = default_encryption.get("KMSMasterKeyID")
+        if algorithm:
+            algorithms.append(f"{algorithm} (KMS)" if kms_key else algorithm)
+    return ("Si" if algorithms else "No"), _compact_join(algorithms)
+
+
+def _s3_bucket_versioning_status(s3, bucket_name):
+    try:
+        versioning = s3.get_bucket_versioning(Bucket=bucket_name)
+        return versioning.get("Status") or "No"
+    except Exception:
+        return "No disponible"
+
+
+def _s3_bucket_logging_status(s3, bucket_name):
+    try:
+        logging_config = s3.get_bucket_logging(Bucket=bucket_name)
+        return "Si" if logging_config.get("LoggingEnabled") else "No"
+    except Exception:
+        return "No disponible"
+
+
+def _s3_bucket_ownership_status(s3, bucket_name):
+    try:
+        ownership = s3.get_bucket_ownership_controls(Bucket=bucket_name)
+        rules = ownership.get("OwnershipControls", {}).get("Rules", [])
+        settings = [rule.get("ObjectOwnership") for rule in rules if rule.get("ObjectOwnership")]
+        return _compact_join(settings) or "No disponible"
+    except Exception as exc:
+        if _aws_error_code(exc) in {"OwnershipControlsNotFoundError", "NoSuchOwnershipControls"}:
+            return "No"
+        return "No disponible"
+
+
+def _s3_bucket_tags_status(s3, bucket_name):
+    try:
+        tag_set = s3.get_bucket_tagging(Bucket=bucket_name).get("TagSet", [])
+    except Exception as exc:
+        if _aws_error_code(exc) == "NoSuchTagSet":
+            return "", 0
+        return "", 0
+
+    tags = {tag.get("Key"): tag.get("Value") for tag in tag_set if tag.get("Key")}
+    return json.dumps(tags, ensure_ascii=False), len(tags)
+
+
+def _s3_governance_status(row):
+    exposure_flags = [
+        row.get("policy_publica") == "Si",
+        row.get("acl_publica") == "Si",
+    ]
+    public_unknown = any(
+        row.get(column) == "No disponible"
+        for column in ["policy_publica", "acl_publica", "bloqueo_publico"]
+    )
+    control_gaps = [
+        row.get("bloqueo_publico") in {"No", "Parcial"},
+        row.get("cifrado_default") in {"No", "No disponible"},
+        row.get("versionado") in {"No", "Suspended", "No disponible"},
+        row.get("logging_acceso") in {"No", "No disponible"},
+        int(row.get("tags_count") or 0) == 0,
+    ]
+
+    if any(exposure_flags):
+        return "Revisar exposicion publica"
+    if public_unknown:
+        return "Validar permisos de lectura"
+    if any(control_gaps):
+        return "Mejorar controles"
+    return "OK"
+
+
+def _s3_public_exposure_status(policy_publica, acl_publica):
+    if policy_publica == "Si" or acl_publica == "Si":
+        return "Si"
+    if policy_publica == "No disponible" or acl_publica == "No disponible":
+        return "No disponible"
+    return "No"
+
+
 def _extract_role_name(role_arn):
     """Retorna el RoleName a partir de un ARN IAM."""
     if not role_arn:
@@ -804,16 +961,43 @@ def get_s3_df(perfil):
         response = s3.list_buckets()
         buckets = []
         for bucket in response.get("Buckets", []):
+            bucket_name = bucket.get("Name")
             try:
-                location_response = s3.get_bucket_location(Bucket=bucket["Name"])
+                location_response = s3.get_bucket_location(Bucket=bucket_name)
                 region = location_response.get("LocationConstraint") or "us-east-1"
             except Exception:
                 region = "unknown"
 
-            buckets.append({
-                "nombre": bucket.get("Name"),
+            bloqueo_publico, bloqueo_publico_detalle = _s3_public_access_block_status(s3, bucket_name)
+            policy_publica = _s3_bucket_policy_public_status(s3, bucket_name)
+            acl_publica, acl_publica_detalle = _s3_acl_public_status(s3, bucket_name)
+            cifrado_default, cifrado_algoritmo = _s3_bucket_encryption_status(s3, bucket_name)
+            versionado = _s3_bucket_versioning_status(s3, bucket_name)
+            logging_acceso = _s3_bucket_logging_status(s3, bucket_name)
+            object_ownership = _s3_bucket_ownership_status(s3, bucket_name)
+            tags, tags_count = _s3_bucket_tags_status(s3, bucket_name)
+
+            row = {
+                "nombre": bucket_name,
                 "creacion": bucket.get("CreationDate"),
                 "region": region,
+                "bloqueo_publico": bloqueo_publico,
+                "bloqueo_publico_detalle": bloqueo_publico_detalle,
+                "policy_publica": policy_publica,
+                "acl_publica": acl_publica,
+                "acl_publica_detalle": acl_publica_detalle,
+                "acceso_publico": _s3_public_exposure_status(policy_publica, acl_publica),
+                "cifrado_default": cifrado_default,
+                "cifrado_algoritmo": cifrado_algoritmo,
+                "versionado": versionado,
+                "logging_acceso": logging_acceso,
+                "object_ownership": object_ownership,
+                "tags": tags,
+                "tags_count": tags_count,
+            }
+            row["estado_gobernanza"] = _s3_governance_status(row)
+            buckets.append({
+                **row,
             })
 
         df = pd.DataFrame(buckets)
