@@ -668,7 +668,7 @@ def download_region_account(account_name, account_profile, region):
         logger.error(f"❌ Error descargando {key}: {e}")
         return result
 
-def download_all_parallel(max_workers=4):
+def _download_all_parallel_legacy(max_workers=4):
     """
     Descarga TODO en paralelo usando ThreadPoolExecutor.
     """
@@ -775,6 +775,335 @@ def download_all_parallel(max_workers=4):
     """)
 
     return results
+
+RESOURCE_DEFINITIONS = {
+    'ec2': {'label': 'EC2', 'global': False},
+    'rds': {'label': 'RDS', 'global': False},
+    'vpc': {'label': 'VPC', 'global': False},
+    'vpc_outbound_ips': {'label': 'VPC Outbound IPs', 'global': False},
+    's3': {'label': 'S3', 'global': True},
+    'iam_users': {'label': 'IAM Users', 'global': True},
+    'lambda': {'label': 'Lambda', 'global': False},
+    'api_gateway': {'label': 'API Gateway', 'global': False},
+    'api_gateway_routes': {'label': 'API Gateway Routes', 'global': False},
+    'cloudformation': {'label': 'CloudFormation', 'global': False},
+    'ssm': {'label': 'SSM', 'global': False},
+    'kms': {'label': 'KMS', 'global': False},
+    'dynamodb': {'label': 'DynamoDB', 'global': False},
+    'sqs': {'label': 'SQS', 'global': False},
+}
+
+
+def _iter_profile_sources():
+    if config is not None and hasattr(config, 'PERFILES'):
+        yield config.PERFILES
+    try:
+        from conector_aws import PERFILES as conector_perfiles  # type: ignore
+        yield conector_perfiles
+    except Exception as e:
+        logger.debug(f"No se pudo leer conector_aws.PERFILES: {e}")
+
+
+def _get_account_global_region(account_name):
+    """Retorna la region base para servicios globales de una cuenta."""
+    for perfiles in _iter_profile_sources():
+        account_config = perfiles.get(account_name, {})
+        if isinstance(account_config, dict) and account_config.get('region'):
+            return account_config['region']
+    return _get_global_region()
+
+
+def _normalize_resource_types(resource_types=None):
+    """Retorna recursos validos preservando el orden definido."""
+    if not resource_types:
+        return list(RESOURCE_DEFINITIONS.keys())
+
+    requested = set(resource_types)
+    unknown = requested - set(RESOURCE_DEFINITIONS.keys())
+    if unknown:
+        raise ValueError(f"Recursos desconocidos: {', '.join(sorted(unknown))}")
+
+    return [key for key in RESOURCE_DEFINITIONS if key in requested]
+
+
+def _load_resource_data(account_profile, region, resource_type):
+    from conector_aws import (
+        get_ec2_df, get_rds_df, get_vpc_df, get_s3_df,
+        get_iam_users_df, get_lambda_df, get_api_gateway_df,
+        get_api_gateway_routes_df, get_cloudformation_df, get_ssm_df,
+        get_kms_df, get_dynamodb_df, get_sqs_df
+    )
+
+    loaders = {
+        'ec2': lambda: get_ec2_df(account_profile, region),
+        'rds': lambda: get_rds_df(account_profile, region),
+        'vpc': lambda: get_vpc_df(account_profile, region),
+        'vpc_outbound_ips': lambda: _get_vpc_outbound_ips(account_profile, region),
+        's3': lambda: get_s3_df(account_profile),
+        'iam_users': lambda: get_iam_users_df(account_profile),
+        'lambda': lambda: get_lambda_df(account_profile, region),
+        'api_gateway': lambda: get_api_gateway_df(account_profile, region),
+        'api_gateway_routes': lambda: get_api_gateway_routes_df(account_profile, region),
+        'cloudformation': lambda: get_cloudformation_df(account_profile, region),
+        'ssm': lambda: get_ssm_df(account_profile, region),
+        'kms': lambda: get_kms_df(account_profile, region),
+        'dynamodb': lambda: get_dynamodb_df(account_profile, region),
+        'sqs': lambda: get_sqs_df(account_profile, region),
+    }
+    return loaders[resource_type]()
+
+
+def _should_skip_download(account_name, region, resource_type, refresh_mode):
+    if refresh_mode == 'force':
+        return False, None
+
+    _, is_fresh, exists = cache_manager.get(account_name, region, resource_type)
+    if refresh_mode == 'missing' and exists:
+        return True, 'skipped_exists'
+    if refresh_mode == 'stale' and exists and is_fresh:
+        return True, 'skipped_fresh'
+    return False, None
+
+
+def download_resource(account_name, account_profile, region, resource_type, refresh_mode='force'):
+    """
+    Descarga un unico recurso para una cuenta-region.
+
+    refresh_mode:
+      - force: consulta AWS y compara siempre.
+      - stale: consulta solo si no existe o esta vencido.
+      - missing: consulta solo si no existe.
+    """
+    resource_info = RESOURCE_DEFINITIONS[resource_type]
+    label = resource_info['label']
+    key = f"{account_name}_{region}_{resource_type}"
+    result = {
+        'key': key,
+        'account': account_name,
+        'region': region,
+        'resource_type': resource_type,
+        'resources': {},
+        'errors': [],
+        'started_at': datetime.now().isoformat()
+    }
+
+    try:
+        skip, skip_status = _should_skip_download(
+            account_name, region, resource_type, refresh_mode
+        )
+        if skip:
+            result['resources'][resource_type] = {
+                'count': 0,
+                'status': skip_status,
+                'saved': False
+            }
+            result['status'] = 'success'
+            result['completed_at'] = datetime.now().isoformat()
+            logger.info(f"{label} omitido para {key}: {skip_status}")
+            return result
+
+        logger.info(f"Descargando {label} para {account_name}/{region}...")
+        data = _load_resource_data(account_profile, region, resource_type)
+        data = _enrich_resource_metadata(account_profile, region, resource_type, data)
+        compare_result = cache_manager.compare_and_update(
+            account_name, region, resource_type, data
+        )
+        result['resources'][resource_type] = {
+            'count': len(data),
+            'status': compare_result.get('status', 'unknown'),
+            'saved': compare_result.get('saved', False)
+        }
+        result['status'] = 'success'
+        result['completed_at'] = datetime.now().isoformat()
+        return result
+    except Exception as e:
+        result['status'] = 'failed'
+        result['errors'].append(f"{label}: {str(e)}")
+        result['completed_at'] = datetime.now().isoformat()
+        logger.error(f"Error descargando {label} para {account_name}/{region}: {e}")
+        return result
+
+
+def _merge_resource_result(target, resource_result):
+    target['resources'].update(resource_result.get('resources', {}))
+    target['errors'].extend(resource_result.get('errors', []))
+
+
+def download_region_account(account_name, account_profile, region, resource_types=None, refresh_mode='force'):
+    """
+    Descarga recursos de una region-cuenta especifica.
+    Si resource_types es None, descarga todos los recursos aplicables.
+    """
+    key = f"{account_name}_{region}"
+    resources = _normalize_resource_types(resource_types)
+    result = {
+        'key': key,
+        'account': account_name,
+        'region': region,
+        'resources': {},
+        'errors': [],
+        'started_at': datetime.now().isoformat()
+    }
+
+    global_region = _get_account_global_region(account_name)
+    for resource_type in resources:
+        if RESOURCE_DEFINITIONS[resource_type]['global'] and region != global_region:
+            continue
+        resource_result = download_resource(
+            account_name, account_profile, region, resource_type, refresh_mode=refresh_mode
+        )
+        _merge_resource_result(result, resource_result)
+
+    result['status'] = 'success' if not result['errors'] else 'partial'
+    if not result['resources'] and result['errors']:
+        result['status'] = 'failed'
+    result['completed_at'] = datetime.now().isoformat()
+    logger.info(f"Completado {key}: {result['resources']}")
+    return result
+
+
+def _build_download_tasks(discovery, account_names=None, regions=None, resource_types=None):
+    account_filter = set(account_names) if account_names else None
+    region_filter = set(regions) if regions else None
+    resources = _normalize_resource_types(resource_types)
+    tasks = []
+
+    for account in discovery['accounts']:
+        account_name = account['name']
+        if account_filter and account_name not in account_filter:
+            continue
+
+        account_profile = account['profile']
+        available_regions = account.get('regions') or []
+        global_region = _get_account_global_region(account_name)
+        selected_regions = [
+            region for region in available_regions
+            if region_filter is None or region in region_filter
+        ]
+
+        if any(RESOURCE_DEFINITIONS[res]['global'] for res in resources):
+            selected_regions.append(global_region)
+
+        for region in dict.fromkeys(selected_regions):
+            region_resources = []
+            for resource_type in resources:
+                is_global = RESOURCE_DEFINITIONS[resource_type]['global']
+                if is_global and region != global_region:
+                    continue
+                if not is_global and region not in available_regions:
+                    continue
+                if region_filter is not None and not is_global and region not in region_filter:
+                    continue
+                region_resources.append(resource_type)
+
+            if region_resources:
+                tasks.append((account_name, account_profile, region, region_resources))
+
+    return tasks
+
+
+def _summarize_download_results(results):
+    changes_summary = {
+        'new': 0,
+        'updated': 0,
+        'unchanged': 0,
+        'skipped': 0,
+        'total_saved': 0,
+        'resources_changed': []
+    }
+
+    for detail in results['details']:
+        for resource_type, resource_data in detail.get('resources', {}).items():
+            if not isinstance(resource_data, dict):
+                continue
+
+            status = resource_data.get('status', 'unknown')
+            saved = resource_data.get('saved', False)
+
+            if status == 'new':
+                changes_summary['new'] += 1
+            elif status == 'updated':
+                changes_summary['updated'] += 1
+                changes_summary['resources_changed'].append(
+                    f"{detail['account']}:{detail['region']}:{resource_type}"
+                )
+            elif status == 'unchanged':
+                changes_summary['unchanged'] += 1
+            elif str(status).startswith('skipped'):
+                changes_summary['skipped'] += 1
+
+            if saved:
+                changes_summary['total_saved'] += 1
+
+    return changes_summary
+
+
+def download_scope(account_names=None, regions=None, resource_types=None, max_workers=4, refresh_mode='force'):
+    """Descarga un subconjunto de cuentas, regiones y recursos."""
+    discovery = cache_manager.load_discovery()
+    if not discovery or discovery.get('status') != 'complete':
+        discovery = discover_regions_and_accounts()
+
+    if discovery.get('status') != 'complete' or not discovery.get('accounts'):
+        logger.error("Discovery no completado")
+        return {'status': 'failed', 'error': 'Discovery incompleto'}
+
+    tasks = _build_download_tasks(discovery, account_names, regions, resource_types)
+    logger.info(f"Iniciando descarga paralela ({max_workers} threads)...")
+    logger.info(f"Total de descargas: {len(tasks)} tareas cuenta-region")
+
+    results = {
+        'total': len(tasks),
+        'completed': 0,
+        'failed': 0,
+        'partial': 0,
+        'details': []
+    }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                download_region_account,
+                account_name,
+                account_profile,
+                region,
+                region_resources,
+                refresh_mode
+            ): (account_name, account_profile, region, region_resources)
+            for account_name, account_profile, region, region_resources in tasks
+        }
+
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                results['details'].append(result)
+
+                if result['status'] == 'success':
+                    results['completed'] += 1
+                elif result['status'] == 'partial':
+                    results['partial'] += 1
+                else:
+                    results['failed'] += 1
+
+                logger.info(f"[{results['completed']}/{results['total']}] {result['key']}")
+
+            except Exception as e:
+                logger.error(f"Error en tarea: {e}")
+                results['failed'] += 1
+
+    results['status'] = 'complete'
+    results['timestamp'] = datetime.now().isoformat()
+    results['changes_summary'] = _summarize_download_results(results)
+    return results
+
+
+def download_all_parallel(max_workers=4):
+    """
+    Descarga TODO en paralelo usando ThreadPoolExecutor.
+    Wrapper compatible con el flujo historico.
+    """
+    return download_scope(max_workers=max_workers, refresh_mode='force')
+
 
 def get_cache_status():
     """Retorna estado del caché actual."""

@@ -64,7 +64,13 @@ SERVICE_EXPORT_CONFIG = [
         "sheet_name": "S3",
         "summary_label": "S3",
         "global_service": True,
-        "preferred_columns": ["cuenta", "nombre", "region", "creacion"],
+        "preferred_columns": [
+            "cuenta", "nombre", "region", "creacion", "acceso_publico",
+            "estado_gobernanza", "bloqueo_publico", "policy_publica",
+            "acl_publica", "cifrado_default", "cifrado_algoritmo",
+            "versionado", "logging_acceso", "object_ownership",
+            "tags_count", "tags", "bloqueo_publico_detalle", "acl_publica_detalle",
+        ],
     },
     {
         "cache_key": "iam_users",
@@ -157,6 +163,8 @@ def _remove_timezones(df):
                     clean_df[column] = clean_df[column].dt.tz_convert("UTC").dt.tz_localize(None)
                 elif clean_df[column].dt.tz is not None:
                     clean_df[column] = clean_df[column].dt.tz_localize(None)
+            elif clean_df[column].dtype == "object":
+                clean_df[column] = clean_df[column].map(_remove_timezone_from_value)
         except Exception as exc:
             logger.warning("Advertencia limpiando %s: %s", column, exc)
             try:
@@ -165,6 +173,20 @@ def _remove_timezones(df):
                 continue
 
     return clean_df
+
+
+def _remove_timezone_from_value(value):
+    """Normaliza timestamps timezone-aware que vienen dentro de columnas object."""
+    try:
+        if isinstance(value, pd.Timestamp):
+            if value.tzinfo is not None:
+                return value.tz_convert("UTC").tz_localize(None).to_pydatetime()
+            return value.to_pydatetime()
+        if hasattr(value, "tzinfo") and value.tzinfo is not None and hasattr(value, "astimezone"):
+            return value.astimezone().replace(tzinfo=None)
+    except Exception:
+        return str(value)
+    return value
 
 
 def _apply_styles(ws, df):
@@ -230,7 +252,7 @@ def _aggregate_service(cache_manager, accounts, perfiles, service_config):
                 service_df["cuenta"] = account
             if "region" not in service_df.columns:
                 service_df["region"] = region
-            dfs.append(service_df)
+            dfs.append(_remove_timezones(service_df))
 
     if not dfs:
         return pd.DataFrame()
@@ -335,5 +357,5 @@ def export_to_excel(cache_manager, accounts, perfiles, output_path="inventario_a
         logger.info("Excel guardado: %s", output_path)
         return output_path
     except Exception as exc:
-        logger.error("Error generando Excel: %s", exc)
+        logger.exception("Error generando Excel: %s", exc)
         return None

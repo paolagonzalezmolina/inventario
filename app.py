@@ -7,7 +7,8 @@ Inventario AWS multi-cuenta en tiempo real.
 import logging
 import re
 import html as html_lib
-from datetime import date, timedelta
+from io import BytesIO
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import boto3
@@ -21,6 +22,7 @@ from cache_manager import cache_manager
 from conector_aws import PERFILES
 from download_engine import (
     download_all_parallel,
+    download_scope,
     get_cache_status,
     initialize_download_engine,
 )
@@ -42,6 +44,169 @@ ALL_REGIONS_OPTION = "__all_regions__"
 PRIORITY_REGIONS = ["us-east-1", "us-east-2"]
 ACCOUNT_DISPLAY_ORDER = ["afex-prod", "afex-digital", "afex-peru", "afex-des"]
 MANDATORY_TAGS = ["Name", "Environment", "Owner", "CostCenter", "Application"]
+LAMBDA_RUNTIME_UPGRADE_RECOMMENDATIONS = {
+    "nodejs10.x": "nodejs24.x",
+    "nodejs12.x": "nodejs24.x",
+    "nodejs14.x": "nodejs24.x",
+    "nodejs16.x": "nodejs24.x",
+    "nodejs18.x": "nodejs24.x",
+    "nodejs20.x": "nodejs24.x",
+    "python2.7": "python3.14",
+    "python3.6": "python3.14",
+    "python3.7": "python3.14",
+    "python3.8": "python3.14",
+    "python3.9": "python3.14",
+    "ruby2.7": "ruby3.4",
+    "ruby3.2": "ruby3.4",
+    "java8": "java21",
+    "dotnetcore2.1": "dotnet8",
+    "dotnetcore3.1": "dotnet8",
+}
+LAMBDA_RUNTIME_UPGRADE_ACTION = (
+    "Validar compatibilidad, actualizar dependencias/layers, probar y desplegar con alias/canary."
+)
+LAMBDA_RUNTIME_EVIDENCE = (
+    "Pruebas exitosas, alias/canary aplicado, monitoreo sin errores y runtime actualizado."
+)
+EXPORT_DIR = Path("exports")
+VULNERABILITY_COLUMNS = [
+    "Cuenta",
+    "AWS Account Id",
+    "Region",
+    "Servicio",
+    "Tipo de recurso",
+    "Recurso",
+    "Producto key",
+    "Producto",
+    "Origen producto",
+    "Confianza producto",
+    "Titulo",
+    "Riesgo",
+    "Severidad",
+    "Prioridad",
+    "Estado",
+    "Tipo hallazgo",
+    "Responsable sugerido",
+    "Apoyo",
+    "Prioridad interna",
+    "Estado remediacion",
+    "Evidencia cierre",
+    "Riesgo aceptado",
+    "Comentario responsable",
+    "Fuente hallazgo",
+    "Fecha extraccion",
+    "Finding Type",
+    "Vulnerability Id",
+    "Fix disponible",
+    "Exploit disponible",
+    "Edad dias",
+    "Version actual",
+    "Version objetivo",
+    "Paquete afectado",
+    "Version instalada",
+    "Version corregida",
+    "Package manager",
+    "File path",
+    "Lambda layers",
+    "Lambda package type",
+    "Lambda last updated at",
+    "Inspector score",
+    "NVD CVSS3 score",
+    "Vendor severity",
+    "EPSS score",
+    "Ultima explotacion",
+    "Accion recomendada",
+    "Remediacion AWS/Inspector",
+    "Evidencia requerida",
+    "Finding ARN",
+    "First seen",
+    "Last seen",
+    "Last updated",
+    "Vendor",
+    "Vendor advisory",
+    "Reference URLs",
+    "Resource tags",
+]
+VULNERABILITY_MAIN_COLUMNS = [
+    "Cuenta",
+    "Region",
+    "Servicio",
+    "Recurso",
+    "Producto",
+    "Tipo hallazgo",
+    "Titulo",
+    "Severidad",
+    "Prioridad interna",
+    "Estado",
+    "Responsable sugerido",
+    "Apoyo",
+    "Estado remediacion",
+    "Fix disponible",
+    "Exploit disponible",
+    "Version actual",
+    "Version objetivo",
+    "Accion recomendada",
+    "Evidencia requerida",
+    "Edad dias",
+]
+VULNERABILITY_BACKLOG_COLUMNS = [
+    "Cuenta",
+    "Region",
+    "Servicio",
+    "Recurso",
+    "Producto",
+    "Tipo hallazgo",
+    "Prioridad interna",
+    "Severidad",
+    "Responsable sugerido",
+    "Apoyo",
+    "Estado remediacion",
+    "Accion recomendada",
+    "Version actual",
+    "Version objetivo",
+    "Fix disponible",
+    "Exploit disponible",
+    "Evidencia requerida",
+    "Evidencia cierre",
+    "Riesgo aceptado",
+    "Comentario responsable",
+    "Fuente hallazgo",
+]
+VULNERABILITY_TECHNICAL_COLUMNS = [
+    "Cuenta",
+    "AWS Account Id",
+    "Region",
+    "Servicio",
+    "Tipo de recurso",
+    "Recurso",
+    "Producto",
+    "Origen producto",
+    "Confianza producto",
+    "Finding Type",
+    "Vulnerability Id",
+    "Paquete afectado",
+    "Version instalada",
+    "Version corregida",
+    "Package manager",
+    "File path",
+    "Lambda layers",
+    "Lambda package type",
+    "Lambda last updated at",
+    "Inspector score",
+    "NVD CVSS3 score",
+    "Vendor severity",
+    "EPSS score",
+    "Ultima explotacion",
+    "Remediacion AWS/Inspector",
+    "Finding ARN",
+    "First seen",
+    "Last seen",
+    "Last updated",
+    "Vendor",
+    "Vendor advisory",
+    "Reference URLs",
+    "Resource tags",
+]
 
 ANALYTICS_SERVICE_LABELS = [
     ("ec2", "EC2", False),
@@ -156,6 +321,17 @@ RESOURCE_OPTIONS = {
     "SQS (Colas)": "sqs",
 }
 
+ALL_SERVICES_OPTION = "__all_services__"
+DOWNLOAD_RESOURCE_OPTIONS = {
+    "Todos los servicios": ALL_SERVICES_OPTION,
+    **RESOURCE_OPTIONS,
+}
+DOWNLOAD_REFRESH_MODES = {
+    "Faltantes o vencidos": "stale",
+    "Forzar comparacion": "force",
+    "Solo faltantes": "missing",
+}
+
 REGIONAL_COMPARISON_TARGET = {
     "account": "afex-prod",
     "left_region": "us-east-1",
@@ -259,6 +435,20 @@ def get_selected_account_names(account_name):
     return [account_name]
 
 
+def _safe_export_slug(value):
+    """Convierte nombres de cuenta/vista en slugs seguros para archivos."""
+    text = str(value or "export").strip().lower()
+    text = re.sub(r"[^a-z0-9_-]+", "_", text)
+    return text.strip("_") or "export"
+
+
+def build_excel_export_path(export_scope):
+    """Crea una ruta unica para evitar bloqueos de archivos Excel abiertos."""
+    EXPORT_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return EXPORT_DIR / f"{_safe_export_slug(export_scope)}_{timestamp}.xlsx"
+
+
 def get_global_region(account_name):
     """Retorna la region base donde se guardan servicios globales."""
     return PERFILES.get(account_name, {}).get("region") or "us-east-1"
@@ -299,6 +489,53 @@ def get_prioritized_regions(account_name):
 def get_region_selector_options(account_name):
     """Retorna opciones del selector con una vista consolidada al inicio."""
     return [ALL_REGIONS_OPTION] + get_prioritized_regions(account_name)
+
+
+def get_download_regions(selected_region):
+    """Convierte el selector de region en filtro para el motor de descarga."""
+    if selected_region == ALL_REGIONS_OPTION:
+        return None
+    return [selected_region]
+
+
+def get_download_resources(selected_service):
+    """Convierte el selector de servicio en filtro para el motor de descarga."""
+    if selected_service == ALL_SERVICES_OPTION:
+        return None
+    return [selected_service]
+
+
+def show_download_result(result):
+    """Muestra el resultado consolidado de una descarga."""
+    if result.get("status") == "failed":
+        st.error(f"Error: {result.get('error', 'Error desconocido')}")
+        return
+
+    completed = result.get("completed", 0)
+    failed = result.get("failed", 0)
+    partial = result.get("partial", 0)
+    summary = result.get("changes_summary", {})
+    summary_text = (
+        f"{completed} completadas, {partial} parciales, {failed} fallidas | "
+        f"{summary.get('new', 0)} nuevas, "
+        f"{summary.get('updated', 0)} actualizadas, "
+        f"{summary.get('unchanged', 0)} sin cambios, "
+        f"{summary.get('skipped', 0)} omitidas"
+    )
+
+    if failed == 0 and partial == 0:
+        st.success(summary_text)
+    else:
+        st.warning(summary_text)
+
+    download_errors = []
+    for detail in result.get("details", []):
+        for error in detail.get("errors", []):
+            download_errors.append(f"{detail['account']} / {detail['region']} -> {error}")
+
+    if download_errors:
+        st.caption("Errores detectados durante la descarga")
+        st.code("\n".join(download_errors[:50]), language=None)
 
 
 def get_service_region(account_name, selected_region, service_key):
@@ -772,7 +1009,7 @@ def build_coverage_dataframe(account_name, selected_region):
                 status = "Falta descargar"
             rows.append(
                 {
-                    "Cuenta": account_name,
+                    "Cuenta": row.get("cuenta", account_name),
                     "Region": region,
                     "Servicio": display_name,
                     "Tipo": "Global" if is_global else "Regional",
@@ -849,7 +1086,7 @@ def build_tag_compliance_dataframe(account_name, selected_region):
                 tag_status = "Sin evidencia de tags"
             rows.append(
                 {
-                    "Cuenta": account_name,
+                    "Cuenta": row.get("cuenta", account_name),
                     "Region": row.get("region", ""),
                     "Servicio": display_name,
                     "Recurso": _resource_identifier(row),
@@ -887,7 +1124,7 @@ def build_billing_recommendations_dataframe(account_name, selected_region):
         if str(row.get("estado", "")).lower() == "stopped":
             rows.append(
                 {
-                    "Cuenta": account_name,
+                    "Cuenta": row.get("cuenta", account_name),
                     "Region": row.get("region", ""),
                     "Servicio": "EC2",
                     "Recurso": _resource_identifier(row),
@@ -899,7 +1136,7 @@ def build_billing_recommendations_dataframe(account_name, selected_region):
         if str(row.get("monitoringState", "")).lower() == "disabled":
             rows.append(
                 {
-                    "Cuenta": account_name,
+                    "Cuenta": row.get("cuenta", account_name),
                     "Region": row.get("region", ""),
                     "Servicio": "EC2",
                     "Recurso": _resource_identifier(row),
@@ -916,7 +1153,7 @@ def build_billing_recommendations_dataframe(account_name, selected_region):
             allocation_id = row.get("allocation_id", "")
             rows.append(
                 {
-                    "Cuenta": account_name,
+                    "Cuenta": row.get("cuenta", account_name),
                     "Region": row.get("region", ""),
                     "Servicio": "Elastic IP",
                     "Recurso": public_ip or allocation_id or _resource_identifier(row),
@@ -931,7 +1168,7 @@ def build_billing_recommendations_dataframe(account_name, selected_region):
         if row.get("type") == "NAT Gateway" and row.get("state") != "available":
             rows.append(
                 {
-                    "Cuenta": account_name,
+                    "Cuenta": row.get("cuenta", account_name),
                     "Region": row.get("region", ""),
                     "Servicio": "NAT Gateway",
                     "Recurso": _resource_identifier(row),
@@ -947,7 +1184,7 @@ def build_billing_recommendations_dataframe(account_name, selected_region):
         if storage >= 1000:
             rows.append(
                 {
-                    "Cuenta": account_name,
+                    "Cuenta": row.get("cuenta", account_name),
                     "Region": row.get("region", ""),
                     "Servicio": "RDS",
                     "Recurso": _resource_identifier(row),
@@ -959,7 +1196,7 @@ def build_billing_recommendations_dataframe(account_name, selected_region):
         if str(row.get("estado", "")).lower() not in {"available", "storage-optimization"}:
             rows.append(
                 {
-                    "Cuenta": account_name,
+                    "Cuenta": row.get("cuenta", account_name),
                     "Region": row.get("region", ""),
                     "Servicio": "RDS",
                     "Recurso": _resource_identifier(row),
@@ -1192,49 +1429,162 @@ def build_estimated_product_cost_dataframe(account_name, selected_region, cost_d
     )
 
 
+def _normalize_vulnerability_dataframe(rows):
+    """Retorna hallazgos con columnas de gestion y detalle tecnico consistentes."""
+    if not rows:
+        return pd.DataFrame(columns=VULNERABILITY_COLUMNS)
+
+    vulnerability_df = pd.DataFrame(rows)
+    extraction_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for column in VULNERABILITY_COLUMNS:
+        if column not in vulnerability_df.columns:
+            vulnerability_df[column] = ""
+    for index, row in vulnerability_df.iterrows():
+        management = get_vulnerability_management_defaults(row, extraction_time)
+        for column, value in management.items():
+            if not str(vulnerability_df.at[index, column] or "").strip():
+                vulnerability_df.at[index, column] = value
+        product = get_vulnerability_product_defaults(row)
+        for column, value in product.items():
+            if not str(vulnerability_df.at[index, column] or "").strip():
+                vulnerability_df.at[index, column] = value
+    return vulnerability_df[VULNERABILITY_COLUMNS]
+
+
+def get_vulnerability_product_defaults(row):
+    """Asigna producto sugerido al hallazgo desde tags o nombre del recurso."""
+    product_key = str(row.get("Producto key") or "").strip()
+    product_name = str(row.get("Producto") or "").strip()
+    if product_key and product_name:
+        return {}
+
+    candidates = [
+        row.get("Resource tags"),
+        row.get("Recurso"),
+        row.get("Titulo"),
+        row.get("Finding ARN"),
+        row.get("Vulnerability Id"),
+    ]
+    for candidate in candidates:
+        inferred_key, inferred_name, source, confidence = _infer_product_from_name(candidate)
+        if inferred_key:
+            return {
+                "Producto key": inferred_key,
+                "Producto": inferred_name,
+                "Origen producto": source,
+                "Confianza producto": confidence,
+            }
+
+    return {
+        "Producto key": "sin_producto",
+        "Producto": "Sin producto",
+        "Origen producto": "Sin evidencia",
+        "Confianza producto": "Baja",
+    }
+
+
+def get_vulnerability_management_defaults(row, extraction_time):
+    """Asigna responsable y estado de gestion inicial segun tipo de hallazgo."""
+    finding_type = str(row.get("Tipo hallazgo") or row.get("Finding Type") or "").lower()
+    service = str(row.get("Servicio") or "").lower()
+    priority = str(row.get("Prioridad") or "").lower()
+    exploit = str(row.get("Exploit disponible") or "").lower()
+    fix = str(row.get("Fix disponible") or "").lower()
+
+    owner = "Ciberseguridad"
+    support = "Infraestructura / Desarrollo"
+    if "lambda" in service and any(term in finding_type for term in ["runtime", "package", "layer"]):
+        owner = "Desarrollo"
+        support = "Infraestructura valida inventario; Ciberseguridad prioriza"
+    elif "rds" in service and any(term in finding_type for term in ["motor", "engine", "version"]):
+        owner = "Infraestructura + Desarrollo"
+        support = "Ciberseguridad valida riesgo"
+    elif "rds" in service:
+        owner = "Infraestructura"
+        support = "Desarrollo valida impacto; Ciberseguridad valida riesgo"
+    elif "iam" in service:
+        owner = "Infraestructura / Seguridad"
+        support = "Dueno funcional valida uso"
+    elif "s3" in service:
+        owner = "Infraestructura / Seguridad"
+        support = "Dueno del dato valida excepciones"
+
+    internal_priority = "P3"
+    if "critical" in priority or ("si" in exploit and "si" in fix):
+        internal_priority = "P0"
+    elif "alta" in priority or "high" in priority:
+        internal_priority = "P1" if "si" in fix else "P2"
+    elif "media" in priority or "medium" in priority:
+        internal_priority = "P3"
+
+    return {
+        "Responsable sugerido": owner,
+        "Apoyo": support,
+        "Prioridad interna": internal_priority,
+        "Estado remediacion": "Nuevo",
+        "Evidencia cierre": "",
+        "Riesgo aceptado": "No",
+        "Comentario responsable": "",
+        "Fuente hallazgo": "Inventario AWS",
+        "Fecha extraccion": extraction_time,
+    }
+
+
 def build_vulnerability_dataframe(account_name, selected_region):
     """Genera hallazgos de version/configuracion desde inventario disponible."""
     rows = []
 
-    deprecated_lambda_runtimes = {
-        "nodejs10.x",
-        "nodejs12.x",
-        "nodejs14.x",
-        "python2.7",
-        "python3.6",
-        "python3.7",
-        "ruby2.7",
-        "java8",
-        "dotnetcore2.1",
-        "dotnetcore3.1",
-    }
-
     lambda_df = _load_service_scope_rows(account_name, selected_region, "lambda", "Lambda")
     for _, row in lambda_df.iterrows():
         runtime = str(row.get("runtime", "")).strip()
-        if runtime in deprecated_lambda_runtimes:
+        runtime_target = LAMBDA_RUNTIME_UPGRADE_RECOMMENDATIONS.get(runtime.lower())
+        if runtime_target:
             rows.append(
                 {
-                    "Cuenta": account_name,
+                    "Cuenta": row.get("cuenta", account_name),
                     "Region": row.get("region", ""),
                     "Servicio": "Lambda",
+                    "Tipo de recurso": "AWS Lambda function",
                     "Recurso": _resource_identifier(row),
+                    "Titulo": f"Actualizar runtime Lambda {runtime}",
                     "Riesgo": f"Runtime obsoleto o deprecado: {runtime}",
+                    "Severidad": "High",
                     "Version actual": runtime,
-                    "Version objetivo": "Runtime soportado vigente para el lenguaje",
+                    "Version objetivo": runtime_target,
+                    "Estado": "Deprecado",
+                    "Tipo hallazgo": "Runtime deprecado",
+                    "Finding Type": "Inventario - Runtime deprecado",
+                    "Fix disponible": "Si",
+                    "Exploit disponible": "No evaluado",
+                    "Lambda package type": row.get("package_type", ""),
+                    "Lambda last updated at": row.get("ultima_modificacion", ""),
+                    "Accion recomendada": LAMBDA_RUNTIME_UPGRADE_ACTION,
+                    "Evidencia requerida": LAMBDA_RUNTIME_EVIDENCE,
                     "Prioridad": "Alta",
                 }
             )
         if str(row.get("estado_ultima_actualizacion", "")).lower() not in {"successful", "n/a", ""}:
             rows.append(
                 {
-                    "Cuenta": account_name,
+                    "Cuenta": row.get("cuenta", account_name),
                     "Region": row.get("region", ""),
                     "Servicio": "Lambda",
+                    "Tipo de recurso": "AWS Lambda function",
                     "Recurso": _resource_identifier(row),
+                    "Titulo": "Revisar ultima actualizacion Lambda",
                     "Riesgo": f"Ultima actualizacion en estado {row.get('estado_ultima_actualizacion')}",
+                    "Severidad": "Medium",
                     "Version actual": runtime,
                     "Version objetivo": "Successful",
+                    "Estado": "Requiere revision",
+                    "Tipo hallazgo": "Estado de despliegue",
+                    "Finding Type": "Inventario - Estado de despliegue",
+                    "Fix disponible": "Si",
+                    "Exploit disponible": "No aplica",
+                    "Lambda package type": row.get("package_type", ""),
+                    "Lambda last updated at": row.get("ultima_modificacion", ""),
+                    "Accion recomendada": "Revisar el ultimo despliegue y confirmar que la funcion queda en Successful.",
+                    "Evidencia requerida": "Estado Successful en Lambda y ejecucion de prueba correcta.",
                     "Prioridad": "Media",
                 }
             )
@@ -1252,26 +1602,46 @@ def build_vulnerability_dataframe(account_name, selected_region):
         if priority:
             rows.append(
                 {
-                    "Cuenta": account_name,
+                    "Cuenta": row.get("cuenta", account_name),
                     "Region": row.get("region", ""),
                     "Servicio": "RDS",
+                    "Tipo de recurso": "AWS RDS instance",
                     "Recurso": _resource_identifier(row),
+                    "Titulo": f"Revisar version {engine} {version}",
                     "Riesgo": f"Motor/version requiere revision: {engine} {version}",
+                    "Severidad": "High" if priority == "Alta" else "Medium",
                     "Version actual": version,
                     "Version objetivo": "Version soportada por AWS y estandar interno",
+                    "Estado": "Requiere revision",
+                    "Tipo hallazgo": "Version de motor",
+                    "Finding Type": "Inventario - Version de motor",
+                    "Fix disponible": "Si",
+                    "Exploit disponible": "No evaluado",
+                    "Accion recomendada": "Validar fin de soporte del motor, plan de upgrade y ventana de mantenimiento.",
+                    "Evidencia requerida": "Plan de upgrade aprobado, snapshot/backups y version final soportada.",
                     "Prioridad": priority,
                 }
             )
         if not bool(row.get("multi_az", False)):
             rows.append(
                 {
-                    "Cuenta": account_name,
+                    "Cuenta": row.get("cuenta", account_name),
                     "Region": row.get("region", ""),
                     "Servicio": "RDS",
+                    "Tipo de recurso": "AWS RDS instance",
                     "Recurso": _resource_identifier(row),
+                    "Titulo": "Habilitar o justificar Multi-AZ",
                     "Riesgo": "Base de datos sin Multi-AZ",
+                    "Severidad": "Medium",
                     "Version actual": version,
                     "Version objetivo": "Multi-AZ para componentes criticos",
+                    "Estado": "Brecha de resiliencia",
+                    "Tipo hallazgo": "Resiliencia",
+                    "Finding Type": "Inventario - Resiliencia",
+                    "Fix disponible": "Si",
+                    "Exploit disponible": "No aplica",
+                    "Accion recomendada": "Confirmar criticidad del servicio y habilitar Multi-AZ si aplica.",
+                    "Evidencia requerida": "Configuracion Multi-AZ o excepcion documentada por criticidad.",
                     "Prioridad": "Media",
                 }
             )
@@ -1281,13 +1651,23 @@ def build_vulnerability_dataframe(account_name, selected_region):
         if row.get("mfa_enabled") is False:
             rows.append(
                 {
-                    "Cuenta": account_name,
+                    "Cuenta": row.get("cuenta", account_name),
                     "Region": row.get("region", ""),
                     "Servicio": "IAM",
+                    "Tipo de recurso": "AWS IAM user",
                     "Recurso": _resource_identifier(row),
+                    "Titulo": "Habilitar MFA en usuario IAM",
                     "Riesgo": "Usuario IAM sin MFA",
+                    "Severidad": "High",
                     "Version actual": "MFA deshabilitado",
                     "Version objetivo": "MFA habilitado",
+                    "Estado": "Brecha de acceso",
+                    "Tipo hallazgo": "Control de acceso",
+                    "Finding Type": "Inventario - Control de acceso",
+                    "Fix disponible": "Si",
+                    "Exploit disponible": "No aplica",
+                    "Accion recomendada": "Habilitar MFA o retirar el usuario si no corresponde a uso interactivo.",
+                    "Evidencia requerida": "MFA activo o excepcion documentada para usuario no interactivo.",
                     "Prioridad": "Alta",
                 }
             )
@@ -1297,31 +1677,28 @@ def build_vulnerability_dataframe(account_name, selected_region):
         if row.get("region") == "unknown":
             rows.append(
                 {
-                    "Cuenta": account_name,
+                    "Cuenta": row.get("cuenta", account_name),
                     "Region": row.get("region", ""),
                     "Servicio": "S3",
+                    "Tipo de recurso": "AWS S3 bucket",
                     "Recurso": _resource_identifier(row),
+                    "Titulo": "Completar evidencia de region S3",
                     "Riesgo": "No se pudo determinar region del bucket",
+                    "Severidad": "Medium",
                     "Version actual": "Sin evidencia completa",
                     "Version objetivo": "Inventario con metadata completa",
+                    "Estado": "Evidencia incompleta",
+                    "Tipo hallazgo": "Evidencia incompleta",
+                    "Finding Type": "Inventario - Evidencia incompleta",
+                    "Fix disponible": "Si",
+                    "Exploit disponible": "No aplica",
+                    "Accion recomendada": "Reprocesar inventario y validar permisos de lectura de ubicacion del bucket.",
+                    "Evidencia requerida": "Region detectada en cache/inventario o causa de acceso documentada.",
                     "Prioridad": "Media",
                 }
             )
 
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "Cuenta",
-                "Region",
-                "Servicio",
-                "Recurso",
-                "Riesgo",
-                "Version actual",
-                "Version objetivo",
-                "Prioridad",
-            ]
-        )
-    return pd.DataFrame(rows)
+    return _normalize_vulnerability_dataframe(rows)
 
 
 def _humanize_product_name(value):
@@ -2520,8 +2897,6 @@ selected_region_label = get_scope_display_label(selected_region)
 st.sidebar.divider()
 st.sidebar.subheader("Descargas")
 
-excel_output_path = Path("aws_inventory.xlsx")
-excel_download_data = None
 selected_export_accounts = get_selected_account_names(selected_account)
 selected_account_label = get_account_display_label(selected_account)
 excel_download_name = (
@@ -2529,34 +2904,59 @@ excel_download_name = (
     if selected_account == ALL_ACCOUNTS_OPTION
     else f"{selected_account}_inventario.xlsx"
 )
+st.session_state.setdefault("excel_download_data", None)
+st.session_state.setdefault("excel_download_name", excel_download_name)
 
-if st.sidebar.button("Descargar cache", use_container_width=True):
-    with st.spinner("Descargando en paralelo..."):
-        result = download_all_parallel(max_workers=4)
-        if result.get("status") == "failed":
-            st.error(f"Error: {result.get('error', 'Error desconocido')}")
+download_refresh_label = st.sidebar.selectbox(
+    "Modo cache",
+    list(DOWNLOAD_REFRESH_MODES.keys()),
+)
+download_service_label = st.sidebar.selectbox(
+    "Servicio cache",
+    list(DOWNLOAD_RESOURCE_OPTIONS.keys()),
+)
+download_refresh_mode = DOWNLOAD_REFRESH_MODES[download_refresh_label]
+download_service = DOWNLOAD_RESOURCE_OPTIONS[download_service_label]
+download_accounts = get_selected_account_names(selected_account)
+download_regions = get_download_regions(selected_region)
+download_resources = get_download_resources(download_service)
+
+if st.sidebar.button("Descargar cache seleccion actual", use_container_width=True):
+    with st.spinner("Descargando seleccion actual..."):
+        result = download_scope(
+            account_names=download_accounts,
+            regions=download_regions,
+            resource_types=download_resources,
+            max_workers=4,
+            refresh_mode=download_refresh_mode,
+        )
+        show_download_result(result)
+
+if st.sidebar.button("Descargar cache cuenta completa", use_container_width=True):
+    with st.spinner("Descargando cuenta completa..."):
+        result = download_scope(
+            account_names=download_accounts,
+            resource_types=download_resources,
+            max_workers=4,
+            refresh_mode=download_refresh_mode,
+        )
+        show_download_result(result)
+
+if st.sidebar.button("Descargar cache total", use_container_width=True):
+    with st.spinner("Descargando cache total..."):
+        if download_refresh_mode == "force" and download_resources is None:
+            result = download_all_parallel(max_workers=4)
         else:
-            completed = result.get("completed", 0)
-            failed = result.get("failed", 0)
-            partial = result.get("partial", 0)
-            if failed == 0 and partial == 0:
-                st.success(f"{completed} completadas, {failed} fallidas")
-            else:
-                st.warning(
-                    f"{completed} completadas, {partial} parciales, {failed} fallidas"
-                )
+            result = download_scope(
+                resource_types=download_resources,
+                max_workers=4,
+                refresh_mode=download_refresh_mode,
+            )
+        show_download_result(result)
 
-            download_errors = []
-            for detail in result.get("details", []):
-                for error in detail.get("errors", []):
-                    download_errors.append(f"{detail['account']} / {detail['region']} -> {error}")
-
-            if download_errors:
-                st.caption("Errores detectados durante la descarga")
-                st.code("\n".join(download_errors[:50]), language=None)
-
-if st.sidebar.button("Descarga .xlsx", use_container_width=True):
+if st.sidebar.button("Archivo .xlsx seleccion actual", use_container_width=True):
     try:
+        excel_output_path = build_excel_export_path(selected_account_label)
         generated_path = export_to_excel(
             cache_manager,
             selected_export_accounts,
@@ -2564,15 +2964,17 @@ if st.sidebar.button("Descarga .xlsx", use_container_width=True):
             str(excel_output_path),
         )
         if generated_path and excel_output_path.exists():
-            excel_download_data = excel_output_path.read_bytes()
+            st.session_state["excel_download_data"] = excel_output_path.read_bytes()
+            st.session_state["excel_download_name"] = excel_download_name
             st.success(f"Excel listo para {selected_account_label}")
         else:
             st.error("No se pudo generar el archivo Excel.")
     except Exception as exc:
         st.error(f"Error generando Excel: {exc}")
 
-if st.sidebar.button("Descarga .xlsx total", use_container_width=True):
+if st.sidebar.button("Archivo .xlsx total", use_container_width=True):
     try:
+        excel_output_path = build_excel_export_path("inventario_global")
         generated_path = export_to_excel(
             cache_manager,
             account_names,
@@ -2580,19 +2982,19 @@ if st.sidebar.button("Descarga .xlsx total", use_container_width=True):
             str(excel_output_path),
         )
         if generated_path and excel_output_path.exists():
-            excel_download_data = excel_output_path.read_bytes()
-            excel_download_name = "inventario_global.xlsx"
+            st.session_state["excel_download_data"] = excel_output_path.read_bytes()
+            st.session_state["excel_download_name"] = "inventario_global.xlsx"
             st.success("Excel global listo para todas las cuentas")
         else:
             st.error("No se pudo generar el Excel global.")
     except Exception as exc:
         st.error(f"Error generando Excel global: {exc}")
 
-if excel_download_data:
+if st.session_state.get("excel_download_data"):
     st.sidebar.download_button(
         "Bajar .xlsx",
-        data=excel_download_data,
-        file_name=excel_download_name,
+        data=st.session_state["excel_download_data"],
+        file_name=st.session_state["excel_download_name"],
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
@@ -2868,6 +3270,46 @@ elif page == "Infraestructura AWS":
             if "region" in display_data.columns:
                 display_data["region"] = display_data["region"].map(get_region_display_label)
 
+            if cache_key == "s3":
+                s3_preferred_columns = [
+                    "nombre",
+                    "region",
+                    "creacion",
+                    "acceso_publico",
+                    "estado_gobernanza",
+                    "bloqueo_publico",
+                    "policy_publica",
+                    "acl_publica",
+                    "cifrado_default",
+                    "cifrado_algoritmo",
+                    "versionado",
+                    "logging_acceso",
+                    "object_ownership",
+                    "tags_count",
+                    "tags",
+                    "bloqueo_publico_detalle",
+                    "acl_publica_detalle",
+                ]
+                ordered_s3_columns = [
+                    column for column in s3_preferred_columns if column in display_data.columns
+                ] + [
+                    column for column in display_data.columns if column not in s3_preferred_columns
+                ]
+                display_data = display_data[ordered_s3_columns]
+
+                if "acceso_publico" in display_data.columns:
+                    public_count = int((display_data["acceso_publico"] == "Si").sum())
+                    unknown_count = int((display_data["acceso_publico"] == "No disponible").sum())
+                    gap_count = (
+                        int((display_data["estado_gobernanza"] != "OK").sum())
+                        if "estado_gobernanza" in display_data.columns
+                        else 0
+                    )
+                    cols = st.columns(3)
+                    cols[0].metric("Buckets publicos", public_count)
+                    cols[1].metric("Validacion pendiente", unknown_count)
+                    cols[2].metric("Brechas gobernanza", gap_count)
+
             if cache_key == "vpc_outbound_ips":
                 ip_display_df = display_data.copy()
                 for column in [
@@ -2998,6 +3440,17 @@ elif page == "Infraestructura AWS":
                     for value in mfa_count.index
                 ]
                 fig = px.pie(values=mfa_count.values, names=mfa_labels, title="MFA Status")
+                fig = style_plotly_figure(fig, theme_name, chart_kind="pie")
+                st.plotly_chart(fig, use_container_width=True)
+
+            elif cache_key == "s3" and "estado_gobernanza" in display_data.columns:
+                st.subheader("Gobernanza S3")
+                governance_count = display_data["estado_gobernanza"].value_counts()
+                fig = px.pie(
+                    values=governance_count.values,
+                    names=governance_count.index,
+                    title="Estado de gobernanza S3",
+                )
                 fig = style_plotly_figure(fig, theme_name, chart_kind="pie")
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -3463,36 +3916,222 @@ elif page == "Vulnerabilidades":
     high_count = int((vulnerability_df["Prioridad"] == "Alta").sum()) if not vulnerability_df.empty else 0
     medium_count = int((vulnerability_df["Prioridad"] == "Media").sum()) if not vulnerability_df.empty else 0
     by_service_count = vulnerability_df["Servicio"].nunique() if not vulnerability_df.empty else 0
+    unique_resources_count = vulnerability_df["Recurso"].nunique() if not vulnerability_df.empty else 0
+    no_owner_count = int((vulnerability_df["Responsable sugerido"].astype(str).str.strip() == "").sum()) if not vulnerability_df.empty else 0
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         st.metric("Hallazgos", len(vulnerability_df))
     with col2:
-        st.metric("Alta prioridad", high_count)
+        st.metric("Recursos unicos", unique_resources_count)
     with col3:
-        st.metric("Media prioridad", medium_count)
+        st.metric("Alta prioridad", high_count)
     with col4:
+        st.metric("Media prioridad", medium_count)
+    with col5:
         st.metric("Servicios afectados", by_service_count)
 
     if vulnerability_df.empty:
         st.success("No se detectaron hallazgos con la informacion cacheada actual.")
     else:
-        st.subheader("Detalle de vulnerabilidades y brechas")
         display_df = sanitize_dataframe_for_display(vulnerability_df)
         display_df["Region"] = display_df["Region"].map(get_region_display_label)
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-        summary_df = vulnerability_df.groupby(["Servicio", "Prioridad"]).size().reset_index(name="Cantidad")
-        fig = px.bar(
-            summary_df,
-            x="Servicio",
-            y="Cantidad",
-            color="Prioridad",
-            barmode="stack",
-            title="Hallazgos por servicio",
+        tab_summary, tab_backlog, tab_owner, tab_product, tab_technical, tab_export = st.tabs(
+            ["Resumen", "Backlog", "Por responsable", "Por producto", "Detalle tecnico", "Export"]
         )
-        fig = style_plotly_figure(fig, theme_name)
-        st.plotly_chart(fig, use_container_width=True)
+
+        with tab_summary:
+            summary_col1, summary_col2, summary_col3 = st.columns(3)
+            with summary_col1:
+                st.metric("Sin responsable", no_owner_count)
+            with summary_col2:
+                p0_p1_count = int(display_df["Prioridad interna"].isin(["P0", "P1"]).sum())
+                st.metric("P0/P1", p0_p1_count)
+            with summary_col3:
+                accepted_count = int((display_df["Riesgo aceptado"] == "Si").sum())
+                st.metric("Riesgo aceptado", accepted_count)
+
+            summary_df = vulnerability_df.groupby(["Servicio", "Prioridad"]).size().reset_index(name="Cantidad")
+            fig = px.bar(
+                summary_df,
+                x="Servicio",
+                y="Cantidad",
+                color="Prioridad",
+                barmode="stack",
+                title="Hallazgos por servicio",
+            )
+            fig = style_plotly_figure(fig, theme_name)
+            st.plotly_chart(fig, use_container_width=True)
+
+            owner_summary_df = (
+                vulnerability_df.groupby(["Responsable sugerido", "Prioridad interna"], dropna=False)
+                .size()
+                .reset_index(name="Cantidad")
+                .sort_values("Cantidad", ascending=False)
+            )
+            st.dataframe(
+                sanitize_dataframe_for_display(owner_summary_df),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with tab_backlog:
+            st.subheader("Backlog de remediacion")
+            backlog_columns = [column for column in VULNERABILITY_BACKLOG_COLUMNS if column in display_df.columns]
+            backlog_export_df = vulnerability_df[
+                [column for column in VULNERABILITY_BACKLOG_COLUMNS if column in vulnerability_df.columns]
+            ]
+            backlog_download = BytesIO()
+            backlog_export_df.to_excel(backlog_download, index=False, sheet_name="Backlog")
+            st.download_button(
+                "Descargar backlog de remediacion",
+                data=backlog_download.getvalue(),
+                file_name="backlog_remediacion.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=False,
+            )
+            st.dataframe(
+                display_df[backlog_columns],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with tab_owner:
+            st.subheader("Hallazgos por responsable")
+            owner_counts_df = (
+                vulnerability_df.groupby("Responsable sugerido", dropna=False)
+                .size()
+                .reset_index(name="Cantidad")
+                .sort_values("Cantidad", ascending=False)
+            )
+            st.dataframe(
+                sanitize_dataframe_for_display(owner_counts_df),
+                use_container_width=True,
+                hide_index=True,
+            )
+            for owner in owner_counts_df["Responsable sugerido"].astype(str).tolist():
+                owner_label = owner or "Sin responsable"
+                owner_df = display_df[display_df["Responsable sugerido"].astype(str) == owner]
+                with st.expander(owner_label, expanded=False):
+                    owner_columns = [
+                        column for column in VULNERABILITY_BACKLOG_COLUMNS if column in owner_df.columns
+                    ]
+                    st.dataframe(owner_df[owner_columns], use_container_width=True, hide_index=True)
+
+        with tab_product:
+            st.subheader("Vulnerabilidades por producto")
+            product_summary_df = (
+                vulnerability_df.groupby(["Producto", "Responsable sugerido", "Prioridad interna"], dropna=False)
+                .agg(
+                    Hallazgos=("Recurso", "size"),
+                    Recursos_unicos=("Recurso", "nunique"),
+                )
+                .reset_index()
+                .sort_values(["Hallazgos", "Recursos_unicos"], ascending=False)
+            )
+            st.dataframe(
+                sanitize_dataframe_for_display(product_summary_df),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            product_totals_df = (
+                vulnerability_df.groupby("Producto", dropna=False)
+                .agg(
+                    Hallazgos=("Recurso", "size"),
+                    Recursos_unicos=("Recurso", "nunique"),
+                )
+                .reset_index()
+                .sort_values("Hallazgos", ascending=False)
+                .head(20)
+            )
+            if not product_totals_df.empty:
+                fig = px.bar(
+                    product_totals_df.sort_values("Hallazgos", ascending=True),
+                    x="Hallazgos",
+                    y="Producto",
+                    orientation="h",
+                    title="Top productos por hallazgos",
+                    color="Hallazgos",
+                )
+                fig = style_plotly_figure(fig, theme_name)
+                st.plotly_chart(fig, use_container_width=True)
+
+            product_export = BytesIO()
+            product_summary_df.to_excel(product_export, index=False, sheet_name="Por_producto")
+            st.download_button(
+                "Descargar resumen por producto",
+                data=product_export.getvalue(),
+                file_name="vulnerabilidades_por_producto.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=False,
+            )
+
+            product_options = product_totals_df["Producto"].astype(str).tolist()
+            if product_options:
+                selected_product = st.selectbox("Producto", product_options)
+                selected_product_df = display_df[display_df["Producto"].astype(str) == selected_product]
+                product_columns = [
+                    column for column in VULNERABILITY_BACKLOG_COLUMNS if column in selected_product_df.columns
+                ]
+                st.dataframe(
+                    selected_product_df[product_columns],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        with tab_technical:
+            st.subheader("Detalle tecnico y trazabilidad")
+            technical_columns = [
+                column for column in VULNERABILITY_TECHNICAL_COLUMNS if column in display_df.columns
+            ]
+            st.dataframe(
+                display_df[technical_columns],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with tab_export:
+            st.subheader("Export")
+            backlog_export_df = vulnerability_df[
+                [column for column in VULNERABILITY_BACKLOG_COLUMNS if column in vulnerability_df.columns]
+            ]
+            full_export = BytesIO()
+            backlog_export = BytesIO()
+            by_owner_export = BytesIO()
+            vulnerability_df.to_excel(full_export, index=False, sheet_name="Vulnerabilidades")
+            backlog_export_df.to_excel(backlog_export, index=False, sheet_name="Backlog")
+            with pd.ExcelWriter(by_owner_export, engine="openpyxl") as writer:
+                for owner, owner_df in vulnerability_df.groupby("Responsable sugerido", dropna=False):
+                    sheet_name = _safe_export_slug(owner or "sin_responsable")[:31] or "sin_responsable"
+                    owner_df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+            export_col1, export_col2, export_col3 = st.columns(3)
+            with export_col1:
+                st.download_button(
+                    "Descargar detalle completo",
+                    data=full_export.getvalue(),
+                    file_name="vulnerabilidades_detalle.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with export_col2:
+                st.download_button(
+                    "Descargar backlog ejecutivo",
+                    data=backlog_export.getvalue(),
+                    file_name="vulnerabilidades_backlog.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with export_col3:
+                st.download_button(
+                    "Descargar por responsable",
+                    data=by_owner_export.getvalue(),
+                    file_name="vulnerabilidades_por_responsable.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
 
 elif page == "Comparacion Regional":
     target_account = REGIONAL_COMPARISON_TARGET["account"]

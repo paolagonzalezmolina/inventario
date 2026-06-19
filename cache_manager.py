@@ -24,6 +24,7 @@ import os
 import hashlib
 import pickle
 import gzip
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 import logging
@@ -37,6 +38,18 @@ CACHE_TTL_DAYS = 7  # Datos frescos por 7 días
 
 # Crear directorio si no existe
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def _register_numpy_pickle_aliases():
+    """Permite leer pickles creados con NumPy 2 desde entornos NumPy 1.x."""
+    try:
+        import numpy.core as numpy_core
+        import numpy.core.numeric as numpy_core_numeric
+
+        sys.modules.setdefault("numpy._core", numpy_core)
+        sys.modules.setdefault("numpy._core.numeric", numpy_core_numeric)
+    except Exception:
+        return
 
 
 class CacheManager:
@@ -131,6 +144,7 @@ class CacheManager:
         
         try:
             # Cargar datos
+            _register_numpy_pickle_aliases()
             with open(cache_file, 'rb') as f:
                 data = pickle.load(f)
             
