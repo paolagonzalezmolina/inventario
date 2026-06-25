@@ -44,6 +44,19 @@ ALL_REGIONS_OPTION = "__all_regions__"
 PRIORITY_REGIONS = ["us-east-1", "us-east-2"]
 ACCOUNT_DISPLAY_ORDER = ["afex-prod", "afex-digital", "afex-peru", "afex-des"]
 MANDATORY_TAGS = ["Name", "Environment", "Owner", "CostCenter", "Application"]
+REGION_SUMMARY_SERVICE_KEYS = [
+    "ec2",
+    "rds",
+    "vpc",
+    "lambda",
+    "api_gateway",
+    "ssm",
+    "kms",
+    "dynamodb",
+    "sqs",
+    "vpc_outbound_ips",
+    "cloudformation",
+]
 LAMBDA_RUNTIME_UPGRADE_RECOMMENDATIONS = {
     "nodejs10.x": "nodejs24.x",
     "nodejs12.x": "nodejs24.x",
@@ -420,7 +433,7 @@ REGIONAL_COMPARISON_SERVICES = [
 
 def get_account_regions(account_name):
     """Retorna las regiones descubiertas para una cuenta con fallback seguro."""
-    discovery = cache_manager.load_discovery() or {}
+    discovery = load_discovery_cached() or {}
     for account in discovery.get("accounts", []):
         if account.get("name") == account_name:
             regions = account.get("regions") or []
@@ -441,6 +454,52 @@ def get_selected_account_names(account_name):
     if account_name == ALL_ACCOUNTS_OPTION:
         return list(PERFILES.keys())
     return [account_name]
+
+
+def _path_version(path):
+    """Retorna una huella liviana para invalidar cache cuando cambia un archivo."""
+    try:
+        stat = Path(path).stat()
+        return (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return (0, 0)
+
+
+def get_discovery_version():
+    """Versiona discovery.json sin leer todo el archivo en cada rerun."""
+    discovery_file = getattr(cache_manager, "discovery_file", "")
+    return _path_version(discovery_file)
+
+
+@st.cache_data(show_spinner=False)
+def _load_discovery_cached(discovery_version):
+    return cache_manager.load_discovery()
+
+
+def load_discovery_cached():
+    """Carga discovery usando cache de Streamlit invalidada por mtime."""
+    return _load_discovery_cached(get_discovery_version())
+
+
+def get_cache_entry_version(account_name, region, service_key):
+    """Versiona un recurso cacheado segun sus archivos pkl/timestamp."""
+    cache_dir = Path(getattr(cache_manager, "cache_dir", ""))
+    region_dir = cache_dir / "by_region_account" / f"{account_name}_{region}"
+    return (
+        _path_version(region_dir / f"{service_key}.pkl"),
+        _path_version(region_dir / f"{service_key}_timestamp.json"),
+    )
+
+
+def get_cache_scope_version(account_name, selected_region, service_keys=None):
+    """Huella compacta del cache que afecta a un alcance de cuenta/region."""
+    keys = tuple(service_keys or [service_key for service_key, _, _ in ANALYTICS_SERVICE_LABELS])
+    version_parts = [get_discovery_version()]
+    for real_account in get_selected_account_names(account_name):
+        for service_key in keys:
+            for region in _service_regions_for_scope(real_account, selected_region, service_key):
+                version_parts.append((real_account, region, service_key, get_cache_entry_version(real_account, region, service_key)))
+    return tuple(version_parts)
 
 
 def _safe_export_slug(value):
@@ -555,17 +614,27 @@ def get_service_region(account_name, selected_region, service_key):
 
 def load_cached_count(account_name, region, service_key):
     """Obtiene la cantidad de filas cacheadas y su estado."""
-    data, is_fresh, exists = cache_manager.get(account_name, region, service_key)
+    data, is_fresh, exists = load_cached_dataframe(account_name, region, service_key)
     count = len(data) if exists and isinstance(data, pd.DataFrame) else 0
     return count, is_fresh, exists
 
 
-def load_cached_dataframe(account_name, region, service_key):
-    """Retorna un DataFrame cacheado con metadatos de estado."""
+@st.cache_data(show_spinner=False)
+def _load_cached_dataframe_cached(account_name, region, service_key, cache_entry_version):
     data, is_fresh, exists = cache_manager.get(account_name, region, service_key)
     if exists and isinstance(data, pd.DataFrame):
         return data.copy(), is_fresh, exists
     return pd.DataFrame(), is_fresh, exists
+
+
+def load_cached_dataframe(account_name, region, service_key):
+    """Retorna un DataFrame cacheado con metadatos de estado."""
+    return _load_cached_dataframe_cached(
+        account_name,
+        region,
+        service_key,
+        get_cache_entry_version(account_name, region, service_key),
+    )
 
 
 def summarize_cache_state(states):
@@ -665,7 +734,8 @@ def load_account_service_dataframe(account_name, service_key, selected_region):
     return combined, summarize_cache_state(states), True
 
 
-def build_account_region_summary(account_name):
+@st.cache_data(show_spinner=False)
+def build_account_region_summary(account_name, cache_version=None):
     """Construye una tabla resumen de conteos por region para una cuenta."""
     regional_service_columns = [
         ("ec2", "EC2"),
@@ -1330,7 +1400,7 @@ def build_coverage_dataframe(account_name, selected_region):
                 status = "Falta descargar"
             rows.append(
                 {
-                    "Cuenta": row.get("cuenta", account_name),
+                    "Cuenta": account_name,
                     "Region": region,
                     "Servicio": display_name,
                     "Tipo": "Global" if is_global else "Regional",
@@ -1438,7 +1508,8 @@ def _build_lambda_last_usage_lookup(lambda_df):
     return lookup
 
 
-def build_tag_compliance_dataframe(account_name, selected_region):
+@st.cache_data(show_spinner=False)
+def build_tag_compliance_dataframe(account_name, selected_region, cache_version=None):
     """Construye analisis transversal de tags obligatorios."""
     rows = []
     for service_key, display_name, _ in ANALYTICS_SERVICE_LABELS:
@@ -1487,7 +1558,8 @@ def _get_numeric(row, columns, default=0):
     return default
 
 
-def build_billing_recommendations_dataframe(account_name, selected_region):
+@st.cache_data(show_spinner=False)
+def build_billing_recommendations_dataframe(account_name, selected_region, cache_version=None):
     """Genera hallazgos FinOps desde el inventario cacheado."""
     rows = []
 
@@ -1746,9 +1818,9 @@ def build_cost_by_service_dataframe(cost_df):
     return grouped
 
 
-def build_estimated_product_cost_dataframe(account_name, selected_region, cost_df):
+def build_estimated_product_cost_dataframe(account_name, selected_region, cost_df, cache_version=None):
     """Estima costo por producto distribuyendo costo por servicio segun recursos detectados."""
-    product_df = build_product_inventory_dataframe(account_name, selected_region)
+    product_df = build_product_inventory_dataframe(account_name, selected_region, cache_version)
     current_df = get_current_month_costs(filter_costs_by_selected_scope(cost_df, selected_region))
     if product_df.empty or current_df.empty:
         return pd.DataFrame(columns=["Producto", "Recursos", "Costo Mensual USD", "% del Total", "Metodo"])
@@ -1902,7 +1974,8 @@ def get_vulnerability_management_defaults(row, extraction_time):
     }
 
 
-def build_vulnerability_dataframe(account_name, selected_region):
+@st.cache_data(show_spinner=False)
+def build_vulnerability_dataframe(account_name, selected_region, cache_version=None):
     """Genera hallazgos de version/configuracion desde inventario disponible."""
     rows = []
 
@@ -2163,7 +2236,8 @@ def _infer_product_for_row(row):
     return "", "", "", ""
 
 
-def build_product_inventory_dataframe(account_name, selected_region):
+@st.cache_data(show_spinner=False)
+def build_product_inventory_dataframe(account_name, selected_region, cache_version=None):
     """Agrupa recursos en productos sugeridos sin persistir cambios."""
     rows = []
     for service_key, display_name, _ in ANALYTICS_SERVICE_LABELS:
@@ -2208,7 +2282,8 @@ def build_product_inventory_dataframe(account_name, selected_region):
     return pd.DataFrame(rows)
 
 
-def build_product_relationships_dataframe(account_name, selected_region):
+@st.cache_data(show_spinner=False)
+def build_product_relationships_dataframe(account_name, selected_region, cache_version=None):
     """Detecta relaciones conocidas entre servicios cacheados."""
     rows = []
     lambda_df = _load_service_scope_rows(account_name, selected_region, "lambda", "Lambda")
@@ -3446,6 +3521,8 @@ if cache_status["discovery_complete"]:
 else:
     st.sidebar.warning("Discovery pendiente")
 
+current_cache_version = get_cache_scope_version(selected_account, selected_region)
+
 if page == "Dashboard":
     st.title("Dashboard Global")
 
@@ -3482,7 +3559,10 @@ if page == "Dashboard":
         if selected_region == ALL_REGIONS_OPTION:
             if selected_account == ALL_ACCOUNTS_OPTION:
                 region_summary_frames = [
-                    build_account_region_summary(account)
+                    build_account_region_summary(
+                        account,
+                        get_cache_scope_version(account, ALL_REGIONS_OPTION, REGION_SUMMARY_SERVICE_KEYS),
+                    )
                     for account in get_selected_account_names(selected_account)
                 ]
                 region_summary_df = (
@@ -3491,7 +3571,10 @@ if page == "Dashboard":
                     else pd.DataFrame()
                 )
             else:
-                region_summary_df = build_account_region_summary(selected_account)
+                region_summary_df = build_account_region_summary(
+                    selected_account,
+                    get_cache_scope_version(selected_account, ALL_REGIONS_OPTION, REGION_SUMMARY_SERVICE_KEYS),
+                )
             if not region_summary_df.empty:
                 region_summary_df = region_summary_df.sort_values(
                     ["Total recursos", "Cuenta", "Region"],
@@ -3573,13 +3656,13 @@ if page == "Dashboard":
 
             for region in get_prioritized_regions(account):
                 for svc, key in regional_services:
-                    data, _, exists = cache_manager.get(account, region, svc)
+                    data, _, exists = load_cached_dataframe(account, region, svc)
                     if exists and isinstance(data, pd.DataFrame):
                         acc_data[key] += len(data)
 
             global_region = get_global_region(account)
             for svc, key in [("s3", "S3"), ("iam_users", "IAM")]:
-                data, _, exists = cache_manager.get(account, global_region, svc)
+                data, _, exists = load_cached_dataframe(account, global_region, svc)
                 if exists and isinstance(data, pd.DataFrame):
                     acc_data[key] = len(data)
 
@@ -3993,8 +4076,8 @@ elif page == "Productos":
         "Agrupacion sugerida de recursos basada en tags, patrones de nombre y relaciones detectadas."
     )
 
-    product_df = build_product_inventory_dataframe(selected_account, selected_region)
-    relationships_df = build_product_relationships_dataframe(selected_account, selected_region)
+    product_df = build_product_inventory_dataframe(selected_account, selected_region, current_cache_version)
+    relationships_df = build_product_relationships_dataframe(selected_account, selected_region, current_cache_version)
     summary_df = build_product_summary_dataframe(product_df, relationships_df)
 
     total_products = len(summary_df)
@@ -4099,8 +4182,8 @@ elif page == "Mapa de Infra":
     st.caption(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
     st.caption("MVP de red por producto basado en recursos y relaciones detectadas desde cache.")
 
-    product_df = build_product_inventory_dataframe(selected_account, selected_region)
-    relationships_df = build_product_relationships_dataframe(selected_account, selected_region)
+    product_df = build_product_inventory_dataframe(selected_account, selected_region, current_cache_version)
+    relationships_df = build_product_relationships_dataframe(selected_account, selected_region, current_cache_version)
     summary_df = build_product_summary_dataframe(product_df, relationships_df)
 
     if summary_df.empty:
@@ -4177,7 +4260,7 @@ elif page == "Tags":
     st.caption(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
     st.caption("Tags obligatorios evaluados: " + ", ".join(MANDATORY_TAGS))
 
-    tags_df = build_tag_compliance_dataframe(selected_account, selected_region)
+    tags_df = build_tag_compliance_dataframe(selected_account, selected_region, current_cache_version)
     if tags_df.empty:
         st.warning("No hay recursos cacheados para analizar tags en este alcance.")
     else:
@@ -4241,7 +4324,11 @@ elif page == "Billing":
     st.title("Billing")
     st.caption(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
 
-    recommendations_df = build_billing_recommendations_dataframe(selected_account, selected_region)
+    recommendations_df = build_billing_recommendations_dataframe(
+        selected_account,
+        selected_region,
+        current_cache_version,
+    )
     high_count = int((recommendations_df["Prioridad"] == "Alta").sum()) if not recommendations_df.empty else 0
     medium_count = int((recommendations_df["Prioridad"] == "Media").sum()) if not recommendations_df.empty else 0
     low_count = int((recommendations_df["Prioridad"] == "Baja").sum()) if not recommendations_df.empty else 0
@@ -4337,6 +4424,7 @@ elif page == "Billing":
             selected_account,
             selected_region,
             cached_cost_df,
+            current_cache_version,
         )
         if not product_cost_df.empty:
             st.subheader("Costo por producto")
@@ -4379,7 +4467,7 @@ elif page == "Vulnerabilidades":
     st.title("Vulnerabilidades")
     st.caption(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
 
-    vulnerability_df = build_vulnerability_dataframe(selected_account, selected_region)
+    vulnerability_df = build_vulnerability_dataframe(selected_account, selected_region, current_cache_version)
     high_count = int((vulnerability_df["Prioridad"] == "Alta").sum()) if not vulnerability_df.empty else 0
     medium_count = int((vulnerability_df["Prioridad"] == "Media").sum()) if not vulnerability_df.empty else 0
     by_service_count = vulnerability_df["Servicio"].nunique() if not vulnerability_df.empty else 0
