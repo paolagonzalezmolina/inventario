@@ -7,7 +7,7 @@ El cache es manejado por download_engine.py y app.py.
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import boto3
 import pandas as pd
@@ -67,6 +67,25 @@ def _safe_to_iso(value):
         return str(value)
 
     return str(value)
+
+
+def _format_bytes_human(value):
+    """Convierte bytes a una lectura compacta para tablas de inventario."""
+    if value in (None, ""):
+        return ""
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return ""
+
+    units = ["B", "KB", "MB", "GB", "TB"]
+    unit_index = 0
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        return f"{size:.0f} {units[unit_index]}"
+    return f"{size:.2f} {units[unit_index]}"
 
 
 def _format_cloudtrail_username(event):
@@ -666,6 +685,65 @@ def _build_lambda_inventory(profile_name, region):
     return functions
 
 
+def _get_lambda_usage_info(profile_name, region, function_name, cloudwatch=None):
+    """Obtiene ultima invocacion Lambda desde metricas CloudWatch."""
+    usage = {
+        "ultima_invocacion": None,
+        "invocaciones_30d": 0,
+        "dias_desde_ultima_invocacion": None,
+        "estado_uso": "Sin metricas CloudWatch",
+        "ventana_uso_dias": 455,
+    }
+    if not function_name:
+        return usage
+
+    cloudwatch = cloudwatch or _get_client(profile_name, "cloudwatch", region)
+    if not cloudwatch:
+        return usage
+
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=usage["ventana_uso_dias"])
+    recent_cutoff = end_time - timedelta(days=30)
+
+    try:
+        response = cloudwatch.get_metric_statistics(
+            Namespace="AWS/Lambda",
+            MetricName="Invocations",
+            Dimensions=[{"Name": "FunctionName", "Value": function_name}],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=86400,
+            Statistics=["Sum"],
+        )
+    except Exception as exc:
+        logger.warning(f"No se pudo consultar uso Lambda {function_name} en {region}: {exc}")
+        usage["estado_uso"] = "No disponible"
+        return usage
+
+    datapoints = response.get("Datapoints", [])
+    invoked_points = [
+        point for point in datapoints
+        if float(point.get("Sum") or 0) > 0 and point.get("Timestamp")
+    ]
+    recent_invocations = sum(
+        float(point.get("Sum") or 0)
+        for point in datapoints
+        if point.get("Timestamp") and point.get("Timestamp") >= recent_cutoff
+    )
+    usage["invocaciones_30d"] = int(recent_invocations)
+
+    if not invoked_points:
+        usage["estado_uso"] = "Sin invocaciones en ventana CloudWatch"
+        return usage
+
+    last_point = max(invoked_points, key=lambda point: point.get("Timestamp"))
+    last_invocation = last_point.get("Timestamp")
+    usage["ultima_invocacion"] = _safe_to_iso(last_invocation)
+    usage["dias_desde_ultima_invocacion"] = max((end_time - last_invocation).days, 0)
+    usage["estado_uso"] = "Activo ultimos 30 dias" if recent_invocations > 0 else "Sin uso reciente"
+    return usage
+
+
 def _append_policy_permissions(policy_document, action_values, resource_values, summary_values, source):
     """Aplana statements Allow para resumir permisos efectivos."""
     statements = policy_document.get("Statement", []) if isinstance(policy_document, dict) else []
@@ -764,16 +842,27 @@ def _get_lambda_role_permissions(profile_name, role_arn, permission_cache):
 def _build_lambda_catalog(profile_name, region):
     """Construye catalogo enriquecido de Lambdas para reutilizar en varias vistas."""
     permission_cache = {}
+    usage_cache = {}
+    cloudwatch_client = _get_client(profile_name, "cloudwatch", region)
     rows = []
     catalog = {}
 
     for func in _build_lambda_inventory(profile_name, region):
         vpc_config = func.get("VpcConfig") or {}
         role_arn = func.get("Role", "")
+        function_name = func.get("FunctionName")
         permission_info = _get_lambda_role_permissions(profile_name, role_arn, permission_cache)
+        if function_name not in usage_cache:
+            usage_cache[function_name] = _get_lambda_usage_info(
+                profile_name,
+                region,
+                function_name,
+                cloudwatch=cloudwatch_client,
+            )
+        usage_info = usage_cache.get(function_name, {})
 
         row = {
-            "nombre": func.get("FunctionName"),
+            "nombre": function_name,
             "arn": func.get("FunctionArn"),
             "handler": func.get("Handler", "N/A"),
             "runtime": func.get("Runtime", "N/A"),
@@ -792,10 +881,14 @@ def _build_lambda_catalog(profile_name, region):
             "access_summary": permission_info.get("lambda_access_summary", ""),
             "creacion": func.get("CreatedDate"),
             "ultima_modificacion": func.get("LastModified"),
+            "ultima_invocacion": usage_info.get("ultima_invocacion"),
+            "invocaciones_30d": usage_info.get("invocaciones_30d", 0),
+            "dias_desde_ultima_invocacion": usage_info.get("dias_desde_ultima_invocacion"),
+            "estado_uso": usage_info.get("estado_uso", "Sin metricas CloudWatch"),
+            "ventana_uso_dias": usage_info.get("ventana_uso_dias", 455),
         }
         rows.append(row)
 
-        function_name = row.get("nombre")
         function_arn = row.get("arn")
         if function_name:
             catalog[function_name] = row
@@ -1030,11 +1123,36 @@ def get_iam_users_df(perfil):
             except Exception:
                 access_keys = []
 
+            access_key_last_used_values = []
+            for access_key in access_keys:
+                access_key_id = access_key.get("AccessKeyId")
+                if not access_key_id:
+                    continue
+                try:
+                    last_used_response = iam.get_access_key_last_used(AccessKeyId=access_key_id)
+                    last_used_date = (
+                        last_used_response
+                        .get("AccessKeyLastUsed", {})
+                        .get("LastUsedDate")
+                    )
+                    if last_used_date:
+                        access_key_last_used_values.append(last_used_date)
+                except Exception as exc:
+                    logger.warning(f"No se pudo consultar ultimo uso de access key {access_key_id}: {exc}")
+
+            password_last_used = user.get("PasswordLastUsed")
+            last_access_candidates = [password_last_used, *access_key_last_used_values]
+            last_access_candidates = [value for value in last_access_candidates if value]
+            last_account_access = max(last_access_candidates) if last_access_candidates else None
+
             users.append({
                 "username": username,
                 "arn": user.get("Arn"),
                 "mfa_enabled": len(mfa_devices) > 0,
                 "access_keys": len(access_keys),
+                "ultimo_acceso_cuenta": last_account_access,
+                "ultimo_acceso_consola": password_last_used,
+                "ultimo_uso_access_key": max(access_key_last_used_values) if access_key_last_used_values else None,
                 "creacion": user.get("CreateDate"),
             })
 
@@ -1358,6 +1476,7 @@ def get_dynamodb_df(perfil, region):
             table = client.describe_table(TableName=table_name).get("Table", {})
             billing_mode = table.get("BillingModeSummary", {}).get("BillingMode") or "PROVISIONED"
             throughput = table.get("ProvisionedThroughput", {})
+            table_size_bytes = table.get("TableSizeBytes")
             rows.append({
                 "nombre": table.get("TableName"),
                 "estado": table.get("TableStatus"),
@@ -1365,7 +1484,8 @@ def get_dynamodb_df(perfil, region):
                 "lectura": throughput.get("ReadCapacityUnits"),
                 "escritura": throughput.get("WriteCapacityUnits"),
                 "items": table.get("ItemCount"),
-                "tamano_bytes": table.get("TableSizeBytes"),
+                "tamano_bytes": table_size_bytes,
+                "tamano_legible": _format_bytes_human(table_size_bytes),
                 "region": region,
                 "creacion": table.get("CreationDateTime"),
             })
