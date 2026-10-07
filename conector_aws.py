@@ -38,6 +38,8 @@ AUDIT_CREATE_EVENTS = {
     "dynamodb": {"CreateTable"},
     "sqs": {"CreateQueue"},
     "vpc_outbound_ips": {"CreateNatGateway", "AllocateAddress", "CreateInternetGateway"},
+    "ebs_volumes": {"CreateVolume"},
+    "ebs_snapshots": {"CreateSnapshot"},
 }
 
 
@@ -139,6 +141,8 @@ def _get_lookup_values(resource_type, row):
         "dynamodb": [row.get("nombre")],
         "sqs": [row.get("url"), row.get("nombre")],
         "vpc_outbound_ips": [row.get("resource_id"), row.get("allocation_id"), row.get("name")],
+        "ebs_volumes": [row.get("id"), row.get("nombre")],
+        "ebs_snapshots": [row.get("id"), row.get("volume_id"), row.get("nombre")],
     }
     seen = []
     for value in value_map.get(resource_type, []):
@@ -182,6 +186,10 @@ def _get_native_audit_values(resource_type, row):
     elif resource_type == "vpc_outbound_ips":
         native_created = row.get("creacion")
         native_updated = row.get("ultima_modificacion")
+    elif resource_type == "ebs_volumes":
+        native_created = row.get("createTime")
+    elif resource_type == "ebs_snapshots":
+        native_created = row.get("startTime")
 
     return _safe_to_iso(native_created), _safe_to_iso(native_updated)
 
@@ -306,6 +314,13 @@ def _get_alarm_lookup_values(resource_type, row):
         "vpc_outbound_ips": {
             "NatGatewayId": [row.get("resource_id")],
             "AllocationId": [row.get("allocation_id")],
+        },
+        "ebs_volumes": {
+            "VolumeId": [row.get("id")],
+        },
+        "ebs_snapshots": {
+            "SnapshotId": [row.get("id")],
+            "VolumeId": [row.get("volume_id")],
         },
     }
 
@@ -971,6 +986,105 @@ def get_ec2_df(perfil, region):
         return df
     except Exception as exc:
         logger.error(f"Error obteniendo EC2 para {perfil}/{region}: {exc}")
+        return pd.DataFrame()
+
+
+def _tag_name(tags, fallback):
+    for tag in tags or []:
+        if tag.get("Key") == "Name":
+            return tag.get("Value") or fallback
+    return fallback
+
+
+def get_ebs_volumes_df(perfil, region):
+    """Obtiene volumenes EBS y su relacion con instancias EC2."""
+    try:
+        ec2 = _get_client(perfil, "ec2", region)
+        if not ec2:
+            return pd.DataFrame()
+
+        rows = []
+        paginator = ec2.get_paginator("describe_volumes")
+        for page in paginator.paginate():
+            for volume in page.get("Volumes", []):
+                volume_id = volume.get("VolumeId")
+                tags = volume.get("Tags", []) or []
+                attachments = volume.get("Attachments", []) or []
+                instance_ids = [att.get("InstanceId") for att in attachments if att.get("InstanceId")]
+                devices = [att.get("Device") for att in attachments if att.get("Device")]
+                attachment_states = [att.get("State") for att in attachments if att.get("State")]
+                delete_flags = [
+                    str(att.get("DeleteOnTermination"))
+                    for att in attachments
+                    if att.get("DeleteOnTermination") is not None
+                ]
+                rows.append(
+                    {
+                        "id": volume_id,
+                        "nombre": _tag_name(tags, volume_id),
+                        "size_gb": volume.get("Size"),
+                        "tipo": volume.get("VolumeType"),
+                        "estado": volume.get("State"),
+                        "iops": volume.get("Iops"),
+                        "throughput": volume.get("Throughput"),
+                        "encrypted": volume.get("Encrypted"),
+                        "kms_key_id": volume.get("KmsKeyId"),
+                        "snapshot_id": volume.get("SnapshotId"),
+                        "availability_zone": volume.get("AvailabilityZone"),
+                        "attached_instance_id": ", ".join(instance_ids),
+                        "attachment_state": ", ".join(attachment_states),
+                        "device": ", ".join(devices),
+                        "delete_on_termination": ", ".join(delete_flags),
+                        "createTime": volume.get("CreateTime"),
+                        "region": region,
+                        "tags": tags,
+                    }
+                )
+
+        df = pd.DataFrame(rows)
+        logger.info(f"EBS Volumes: {len(df)} volumenes en {region}")
+        return df
+    except Exception as exc:
+        logger.error(f"Error obteniendo EBS Volumes para {perfil}/{region}: {exc}")
+        return pd.DataFrame()
+
+
+def get_ebs_snapshots_df(perfil, region):
+    """Obtiene snapshots EBS propios."""
+    try:
+        ec2 = _get_client(perfil, "ec2", region)
+        if not ec2:
+            return pd.DataFrame()
+
+        rows = []
+        paginator = ec2.get_paginator("describe_snapshots")
+        for page in paginator.paginate(OwnerIds=["self"]):
+            for snapshot in page.get("Snapshots", []):
+                snapshot_id = snapshot.get("SnapshotId")
+                tags = snapshot.get("Tags", []) or []
+                rows.append(
+                    {
+                        "id": snapshot_id,
+                        "nombre": _tag_name(tags, snapshot_id),
+                        "volume_id": snapshot.get("VolumeId"),
+                        "volume_size_gb": snapshot.get("VolumeSize"),
+                        "estado": snapshot.get("State"),
+                        "startTime": snapshot.get("StartTime"),
+                        "progress": snapshot.get("Progress"),
+                        "encrypted": snapshot.get("Encrypted"),
+                        "kms_key_id": snapshot.get("KmsKeyId"),
+                        "description": snapshot.get("Description"),
+                        "owner_id": snapshot.get("OwnerId"),
+                        "region": region,
+                        "tags": tags,
+                    }
+                )
+
+        df = pd.DataFrame(rows)
+        logger.info(f"EBS Snapshots: {len(df)} snapshots en {region}")
+        return df
+    except Exception as exc:
+        logger.error(f"Error obteniendo EBS Snapshots para {perfil}/{region}: {exc}")
         return pd.DataFrame()
 
 
