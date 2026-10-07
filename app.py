@@ -27,6 +27,19 @@ from download_engine import (
     initialize_download_engine,
 )
 from export_to_excel import export_to_excel
+from inventory_scope import (
+    ALL_ACCOUNTS_OPTION,
+    ALL_REGIONS_OPTION,
+    DASHBOARD_SERVICE_CONFIG,
+    GLOBAL_SERVICES,
+    PRIORITY_REGIONS,
+    build_dashboard_count_rows,
+    get_account_regions as resolve_account_regions,
+    get_global_region as resolve_global_region,
+    get_prioritized_regions as resolve_prioritized_regions,
+    get_selected_account_names as resolve_selected_account_names,
+    resolve_inventory_scope,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,12 +51,23 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-GLOBAL_SERVICES = {"s3", "iam_users"}
-ALL_ACCOUNTS_OPTION = "__all_accounts__"
-ALL_REGIONS_OPTION = "__all_regions__"
-PRIORITY_REGIONS = ["us-east-1", "us-east-2"]
 ACCOUNT_DISPLAY_ORDER = ["afex-prod", "afex-digital", "afex-peru", "afex-des"]
 MANDATORY_TAGS = ["Name", "Environment", "Owner", "CostCenter", "Application"]
+REGION_SUMMARY_SERVICE_KEYS = [
+    "ec2",
+    "rds",
+    "vpc",
+    "lambda",
+    "api_gateway",
+    "ssm",
+    "kms",
+    "dynamodb",
+    "sqs",
+    "vpc_outbound_ips",
+    "ebs_volumes",
+    "ebs_snapshots",
+    "cloudformation",
+]
 LAMBDA_RUNTIME_UPGRADE_RECOMMENDATIONS = {
     "nodejs10.x": "nodejs24.x",
     "nodejs12.x": "nodejs24.x",
@@ -110,6 +134,10 @@ VULNERABILITY_COLUMNS = [
     "Lambda layers",
     "Lambda package type",
     "Lambda last updated at",
+    "Lambda last invoked at",
+    "Lambda invocations 30d",
+    "Lambda idle days",
+    "Lambda usage status",
     "Inspector score",
     "NVD CVSS3 score",
     "Vendor severity",
@@ -192,6 +220,10 @@ VULNERABILITY_TECHNICAL_COLUMNS = [
     "Lambda layers",
     "Lambda package type",
     "Lambda last updated at",
+    "Lambda last invoked at",
+    "Lambda invocations 30d",
+    "Lambda idle days",
+    "Lambda usage status",
     "Inspector score",
     "NVD CVSS3 score",
     "Vendor severity",
@@ -213,6 +245,8 @@ ANALYTICS_SERVICE_LABELS = [
     ("rds", "RDS", False),
     ("vpc", "VPC", False),
     ("vpc_outbound_ips", "NAT/IPs salida", False),
+    ("ebs_volumes", "EBS Volumes", False),
+    ("ebs_snapshots", "EBS Snapshots", False),
     ("lambda", "Lambda", False),
     ("api_gateway", "API Gateway", False),
     ("api_gateway_routes", "API Gateway -> Lambda", False),
@@ -224,6 +258,9 @@ ANALYTICS_SERVICE_LABELS = [
     ("s3", "S3", True),
     ("iam_users", "IAM Users", True),
 ]
+ANALYTICS_CACHE_SERVICE_KEYS = tuple(
+    service_key for service_key, _, _ in ANALYTICS_SERVICE_LABELS
+)
 
 TAG_COLUMN_CANDIDATES = ["tags", "Tags", "tag_set", "TagSet"]
 PRODUCT_TAG_KEYS = ["Application", "Product", "Service", "Project", "Sistema", "App"]
@@ -289,19 +326,7 @@ REGION_DISPLAY_NAMES = {
 }
 
 SERVICE_LABELS = [
-    ("ec2", "EC2"),
-    ("rds", "RDS"),
-    ("vpc", "VPC"),
-    ("vpc_outbound_ips", "NAT/IPs salida"),
-    ("s3", "S3"),
-    ("iam_users", "IAM"),
-    ("lambda", "Lambda"),
-    ("api_gateway", "API GW"),
-    ("cloudformation", "CloudFormation"),
-    ("ssm", "SSM"),
-    ("kms", "KMS"),
-    ("dynamodb", "DynamoDB"),
-    ("sqs", "SQS"),
+    (service["cache_key"], service["label"]) for service in DASHBOARD_SERVICE_CONFIG
 ]
 
 RESOURCE_OPTIONS = {
@@ -309,6 +334,8 @@ RESOURCE_OPTIONS = {
     "RDS (Bases de datos)": "rds",
     "VPC (Redes)": "vpc",
     "NAT Gateways (IPs salida)": "vpc_outbound_ips",
+    "EBS Volumes": "ebs_volumes",
+    "EBS Snapshots": "ebs_snapshots",
     "S3 (Buckets)": "s3",
     "IAM Users": "iam_users",
     "Lambda (Funciones)": "lambda",
@@ -412,13 +439,7 @@ REGIONAL_COMPARISON_SERVICES = [
 
 def get_account_regions(account_name):
     """Retorna las regiones descubiertas para una cuenta con fallback seguro."""
-    discovery = cache_manager.load_discovery() or {}
-    for account in discovery.get("accounts", []):
-        if account.get("name") == account_name:
-            regions = account.get("regions") or []
-            if regions:
-                return regions
-    return PERFILES.get(account_name, {}).get("regiones") or ["us-east-1"]
+    return resolve_account_regions(PERFILES, load_discovery_cached(), account_name)
 
 
 def get_account_display_label(account_name):
@@ -430,9 +451,64 @@ def get_account_display_label(account_name):
 
 def get_selected_account_names(account_name):
     """Expande la opcion global a la lista real de cuentas."""
-    if account_name == ALL_ACCOUNTS_OPTION:
-        return list(PERFILES.keys())
-    return [account_name]
+    return resolve_selected_account_names(PERFILES, account_name)
+
+
+def _path_version(path):
+    """Retorna una huella liviana para invalidar cache cuando cambia un archivo."""
+    try:
+        stat = Path(path).stat()
+        return (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return (0, 0)
+
+
+def get_discovery_version():
+    """Versiona discovery.json sin leer todo el archivo en cada rerun."""
+    discovery_file = getattr(cache_manager, "discovery_file", "")
+    return _path_version(discovery_file)
+
+
+@st.cache_data(show_spinner=False)
+def _load_discovery_cached(discovery_version):
+    return cache_manager.load_discovery()
+
+
+def load_discovery_cached():
+    """Carga discovery usando cache de Streamlit invalidada por mtime."""
+    return _load_discovery_cached(get_discovery_version())
+
+
+@st.cache_data(show_spinner=False, ttl=10)
+def load_cache_status_cached():
+    """Evita escanear todo el cache en cada rerun de navegacion."""
+    return get_cache_status()
+
+
+def get_cache_entry_version(account_name, region, service_key):
+    """Versiona un recurso cacheado segun sus archivos pkl/timestamp."""
+    cache_dir = Path(getattr(cache_manager, "cache_dir", ""))
+    region_dir = cache_dir / "by_region_account" / f"{account_name}_{region}"
+    return (
+        _path_version(region_dir / f"{service_key}.pkl"),
+        _path_version(region_dir / f"{service_key}_timestamp.json"),
+    )
+
+
+def get_cache_scope_version(account_name, selected_region, service_keys=None):
+    """Huella compacta del cache que afecta a un alcance de cuenta/region."""
+    keys = tuple(service_keys or [service_key for service_key, _, _ in ANALYTICS_SERVICE_LABELS])
+    version_parts = [get_discovery_version()]
+    for real_account in get_selected_account_names(account_name):
+        for service_key in keys:
+            for region in _service_regions_for_scope(real_account, selected_region, service_key):
+                version_parts.append((real_account, region, service_key, get_cache_entry_version(real_account, region, service_key)))
+    return tuple(version_parts)
+
+
+def get_analytics_cache_version(account_name, selected_region):
+    """Versiona solo los servicios usados por vistas analiticas transversales."""
+    return get_cache_scope_version(account_name, selected_region, ANALYTICS_CACHE_SERVICE_KEYS)
 
 
 def _safe_export_slug(value):
@@ -451,7 +527,7 @@ def build_excel_export_path(export_scope):
 
 def get_global_region(account_name):
     """Retorna la region base donde se guardan servicios globales."""
-    return PERFILES.get(account_name, {}).get("region") or "us-east-1"
+    return resolve_global_region(PERFILES, account_name)
 
 
 def get_region_display_label(region_code):
@@ -471,19 +547,7 @@ def get_scope_display_label(region_code):
 
 def get_prioritized_regions(account_name):
     """Ordena regiones priorizando Virginia/Ohio y luego el resto alfabeticamente."""
-    if account_name == ALL_ACCOUNTS_OPTION:
-        regions = []
-        for real_account in get_selected_account_names(account_name):
-            regions.extend(get_account_regions(real_account))
-        regions = list(dict.fromkeys(regions))
-        prioritized = [region for region in PRIORITY_REGIONS if region in regions]
-        remaining = sorted(region for region in regions if region not in prioritized)
-        return prioritized + remaining
-
-    regions = list(dict.fromkeys(get_account_regions(account_name)))
-    prioritized = [region for region in PRIORITY_REGIONS if region in regions]
-    remaining = sorted(region for region in regions if region not in prioritized)
-    return prioritized + remaining
+    return resolve_prioritized_regions(PERFILES, load_discovery_cached(), account_name)
 
 
 def get_region_selector_options(account_name):
@@ -547,17 +611,27 @@ def get_service_region(account_name, selected_region, service_key):
 
 def load_cached_count(account_name, region, service_key):
     """Obtiene la cantidad de filas cacheadas y su estado."""
-    data, is_fresh, exists = cache_manager.get(account_name, region, service_key)
+    data, is_fresh, exists = load_cached_dataframe(account_name, region, service_key)
     count = len(data) if exists and isinstance(data, pd.DataFrame) else 0
     return count, is_fresh, exists
 
 
-def load_cached_dataframe(account_name, region, service_key):
-    """Retorna un DataFrame cacheado con metadatos de estado."""
+@st.cache_data(show_spinner=False)
+def _load_cached_dataframe_cached(account_name, region, service_key, cache_entry_version):
     data, is_fresh, exists = cache_manager.get(account_name, region, service_key)
     if exists and isinstance(data, pd.DataFrame):
         return data.copy(), is_fresh, exists
     return pd.DataFrame(), is_fresh, exists
+
+
+def load_cached_dataframe(account_name, region, service_key):
+    """Retorna un DataFrame cacheado con metadatos de estado."""
+    return _load_cached_dataframe_cached(
+        account_name,
+        region,
+        service_key,
+        get_cache_entry_version(account_name, region, service_key),
+    )
 
 
 def summarize_cache_state(states):
@@ -657,7 +731,8 @@ def load_account_service_dataframe(account_name, service_key, selected_region):
     return combined, summarize_cache_state(states), True
 
 
-def build_account_region_summary(account_name):
+@st.cache_data(show_spinner=False)
+def build_account_region_summary(account_name, cache_version=None):
     """Construye una tabla resumen de conteos por region para una cuenta."""
     regional_service_columns = [
         ("ec2", "EC2"),
@@ -692,6 +767,17 @@ def build_account_region_summary(account_name):
         rows.append(row)
 
     return pd.DataFrame(rows)
+
+
+def render_metric_cards(metric_items, columns_count=5):
+    """Renderiza tarjetas metricas en filas, usando el orden recibido."""
+    cols = st.columns(columns_count)
+    for idx, (display_name, count, status) in enumerate(metric_items):
+        with cols[idx % columns_count]:
+            if status:
+                st.metric(display_name, count, delta=status)
+            else:
+                st.metric(display_name, count)
 
 
 def build_summary_table_html(df):
@@ -940,6 +1026,71 @@ def sanitize_dataframe_for_display(df):
     return sanitized
 
 
+def _string_contains_mask(series, query):
+    """Retorna mascara case-insensitive sin tratar el texto como regex."""
+    return series.fillna("").astype(str).str.contains(str(query).strip(), case=False, regex=False, na=False)
+
+
+def _sorted_filter_values(series):
+    values = []
+    for value in series.dropna().astype(str).unique().tolist():
+        text = value.strip()
+        if text:
+            values.append(text)
+    return sorted(values, key=lambda item: item.lower())
+
+
+def render_excel_like_filters(df, key_prefix, filter_columns):
+    """Renderiza filtros de tabla con busqueda por texto y seleccion de valores."""
+    if df is None or df.empty:
+        return df
+
+    available_columns = [column for column in filter_columns if column in df.columns]
+    filtered_df = df.copy()
+
+    with st.expander("Filtros de tabla", expanded=True):
+        global_query = st.text_input(
+            "Buscar en toda la tabla",
+            key=f"{key_prefix}_global_query",
+            placeholder="Ej: TBK",
+        )
+        if global_query:
+            masks = [_string_contains_mask(filtered_df[column], global_query) for column in available_columns]
+            if masks:
+                combined_mask = masks[0]
+                for mask in masks[1:]:
+                    combined_mask = combined_mask | mask
+                filtered_df = filtered_df[combined_mask]
+
+        for start in range(0, len(available_columns), 3):
+            columns = st.columns(min(3, len(available_columns) - start))
+            for idx, column_name in enumerate(available_columns[start:start + 3]):
+                with columns[idx]:
+                    contains_query = st.text_input(
+                        f"{column_name} contiene",
+                        key=f"{key_prefix}_{column_name}_contains",
+                        placeholder="Escribe para filtrar",
+                    )
+                    if contains_query:
+                        filtered_df = filtered_df[_string_contains_mask(filtered_df[column_name], contains_query)]
+
+                    options = _sorted_filter_values(df[column_name])
+                    selected_values = st.multiselect(
+                        column_name,
+                        options=options,
+                        key=f"{key_prefix}_{column_name}_selected",
+                        placeholder="Escribe para seleccionar",
+                    )
+                    if selected_values:
+                        filtered_df = filtered_df[
+                            filtered_df[column_name].fillna("").astype(str).isin(selected_values)
+                        ]
+
+        st.caption(f"Mostrando {len(filtered_df)} de {len(df)} registros")
+
+    return filtered_df
+
+
 def ensure_monitoring_alert_columns(df):
     """Asegura columnas de alertas en tablas de infraestructura."""
     if df is None or df.empty:
@@ -958,6 +1109,308 @@ def ensure_monitoring_alert_columns(df):
         if column not in enriched.columns:
             enriched[column] = default_value
     return enriched
+
+
+def ensure_lambda_usage_columns(df):
+    """Asegura columnas de ultimo uso Lambda aunque el cache sea anterior."""
+    if df is None or df.empty:
+        return df
+    enriched = df.copy()
+    defaults = {
+        "ultima_invocacion": "",
+        "invocaciones_30d": "",
+        "dias_desde_ultima_invocacion": "",
+        "estado_uso": "Pendiente de descarga",
+        "ventana_uso_dias": "",
+    }
+    for column, default_value in defaults.items():
+        if column not in enriched.columns:
+            enriched[column] = default_value
+    return enriched
+
+
+def order_lambda_columns(df):
+    """Mueve las columnas de uso Lambda cerca del identificador principal."""
+    if df is None or df.empty:
+        return df
+    ordered_df = df.copy()
+    if "runtime" in ordered_df.columns:
+        ordered_df["runtime_objetivo"] = ordered_df["runtime"].astype(str).str.lower().map(
+            LAMBDA_RUNTIME_UPGRADE_RECOMMENDATIONS
+        ).fillna("")
+    preferred_columns = [
+        "nombre",
+        "arn",
+        "region",
+        "runtime",
+        "runtime_objetivo",
+        "estado",
+        "ultima_invocacion",
+        "invocaciones_30d",
+        "dias_desde_ultima_invocacion",
+        "estado_uso",
+        "ventana_uso_dias",
+        "ultima_modificacion",
+        "fecha_ultima_modificacion",
+        "creacion",
+        "fecha_creacion",
+    ]
+    ordered_columns = [column for column in preferred_columns if column in ordered_df.columns]
+    ordered_columns += [column for column in ordered_df.columns if column not in ordered_columns]
+    return ordered_df[ordered_columns]
+
+
+def format_bytes_human(value):
+    """Convierte bytes a una lectura compacta en KB/MB/GB/TB."""
+    if pd.isna(value):
+        return ""
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if size < 0:
+        return ""
+
+    units = ["B", "KB", "MB", "GB", "TB"]
+    unit_index = 0
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        return f"{size:.0f} {units[unit_index]}"
+    return f"{size:.2f} {units[unit_index]}"
+
+
+def add_dynamodb_readable_size(df):
+    """Agrega tamano legible junto a tamano_bytes para DynamoDB."""
+    if df is None or df.empty or "tamano_bytes" not in df.columns:
+        return df
+    enriched = df.copy()
+    enriched["tamano_legible"] = enriched["tamano_bytes"].apply(format_bytes_human)
+    ordered_columns = []
+    for column in enriched.columns:
+        if column == "tamano_legible":
+            continue
+        ordered_columns.append(column)
+        if column == "tamano_bytes":
+            ordered_columns.append("tamano_legible")
+    return enriched[[column for column in ordered_columns if column in enriched.columns]]
+
+
+def format_integer_thousands_es(value):
+    """Formatea enteros con separador de miles latino."""
+    if pd.isna(value):
+        return ""
+    try:
+        return f"{float(value):,.0f}".replace(",", ".")
+    except (TypeError, ValueError):
+        return value
+
+
+def ensure_iam_access_columns(df):
+    """Asegura y ordena columnas de ultimo acceso IAM."""
+    if df is None or df.empty:
+        return df
+    enriched = df.copy()
+    defaults = {
+        "ultimo_acceso_cuenta": "Pendiente de descarga",
+        "ultimo_acceso_consola": "",
+        "ultimo_uso_access_key": "",
+    }
+    for column, default_value in defaults.items():
+        if column not in enriched.columns:
+            enriched[column] = default_value
+
+    preferred_columns = [
+        "username",
+        "arn",
+        "ultimo_acceso_cuenta",
+        "ultimo_acceso_consola",
+        "ultimo_uso_access_key",
+        "mfa_enabled",
+        "access_keys",
+        "creacion",
+        "usuario_creador",
+        "fecha_creacion",
+        "fecha_ultima_modificacion",
+    ]
+    ordered_columns = [column for column in preferred_columns if column in enriched.columns]
+    ordered_columns += [column for column in enriched.columns if column not in ordered_columns]
+    return enriched[ordered_columns]
+
+
+LAMBDA_USAGE_CLASSIFICATION_ORDER = ["sin invocacion", "2025", "Ene - Abr", "May", "Jun"]
+LAMBDA_USAGE_CLASSIFICATION_COLORS = {
+    "sin invocacion": "#f4cccc",
+    "2025": "#f4cccc",
+    "Ene - Abr": "#fce5cd",
+    "May": "#d9ead3",
+    "Jun": "#d9ead3",
+}
+LAMBDA_USAGE_CLASSIFICATION_DETAILS = {
+    "Jun": "Uso reciente, priorizar actualizacion",
+    "May": "Uso reciente moderado",
+    "Ene - Abr": "Baja actividad, revisar necesidad",
+    "2025": "Candidato a eliminar",
+    "sin invocacion": "Candidato a eliminar",
+}
+
+
+def _split_region_code_and_name(region_value):
+    """Separa una region renderizada como codigo y nombre corto."""
+    region_text = str(region_value or "").strip()
+    if not region_text:
+        return "", ""
+    if "(" in region_text and region_text.endswith(")"):
+        code, name = region_text.rsplit("(", 1)
+        return code.strip(), name.rstrip(")").strip()
+    return region_text, REGION_DISPLAY_NAMES.get(region_text, "")
+
+
+def classify_lambda_usage(last_invoked_at, usage_status):
+    """Clasifica uso Lambda en los tramos operativos usados para priorizar."""
+    status_text = str(usage_status or "").strip().lower()
+    last_invoked_text = str(last_invoked_at or "").strip()
+    if (
+        not last_invoked_text
+        or last_invoked_text.lower() in {"none", "nan", "nat"}
+        or "sin invocaciones" in status_text
+    ):
+        return "sin invocacion"
+
+    last_invoked = pd.to_datetime(last_invoked_text, errors="coerce", utc=True)
+    if pd.isna(last_invoked):
+        return "sin invocacion"
+
+    year = int(last_invoked.year)
+    month = int(last_invoked.month)
+    if year <= 2025:
+        return "2025"
+    if year == 2026 and month <= 4:
+        return "Ene - Abr"
+    if year == 2026 and month == 5:
+        return "May"
+    if year == 2026 and month == 6:
+        return "Jun"
+    return f"{year}-{month:02d}"
+
+
+def prepare_vulnerability_technical_display(df):
+    """Ordena y enriquece la tabla tecnica para lectura operativa tipo Excel."""
+    if df is None or df.empty:
+        return df
+
+    prepared = df.copy()
+    if "Region" in prepared.columns:
+        region_parts = prepared["Region"].apply(_split_region_code_and_name)
+        prepared["Region2"] = region_parts.apply(lambda value: value[1])
+        prepared["Region"] = region_parts.apply(lambda value: value[0])
+
+    prepared["Clasificacion uso Lambda"] = ""
+    prepared["Detalle clasificacion Lambda"] = ""
+    lambda_mask = prepared["Servicio"].astype(str).eq("Lambda") if "Servicio" in prepared.columns else False
+    if isinstance(lambda_mask, pd.Series) and lambda_mask.any():
+        prepared.loc[lambda_mask, "Clasificacion uso Lambda"] = prepared.loc[lambda_mask].apply(
+            lambda row: classify_lambda_usage(
+                row.get("Lambda last invoked at"),
+                row.get("Lambda usage status"),
+            ),
+            axis=1,
+        )
+        prepared.loc[lambda_mask, "Detalle clasificacion Lambda"] = prepared.loc[
+            lambda_mask,
+            "Clasificacion uso Lambda",
+        ].map(LAMBDA_USAGE_CLASSIFICATION_DETAILS).fillna("Revisar manualmente")
+
+    preferred_columns = [
+        "Clasificacion uso Lambda",
+        "Detalle clasificacion Lambda",
+        "Lambda invocations 30d",
+        "Cuenta",
+        "Region2",
+        "Region",
+        "Servicio",
+        "Tipo de recurso",
+        "Recurso",
+        "Tipo hallazgo",
+        "Finding Type",
+        "Version actual",
+        "Version objetivo",
+        "Lambda last updated at",
+        "Lambda last invoked at",
+        "Lambda idle days",
+        "Lambda usage status",
+        "Producto",
+        "Origen producto",
+        "Confianza producto",
+    ]
+    ordered_columns = [column for column in preferred_columns if column in prepared.columns]
+    ordered_columns += [column for column in VULNERABILITY_TECHNICAL_COLUMNS if column in prepared.columns and column not in ordered_columns]
+    return prepared[ordered_columns]
+
+
+def add_lambda_usage_classification_for_export(df):
+    """Agrega clasificacion Lambda a exports manteniendo el resto de columnas."""
+    if df is None or df.empty:
+        return df
+
+    exported = df.copy()
+    exported["Clasificacion uso Lambda"] = ""
+    exported["Detalle clasificacion Lambda"] = ""
+
+    lambda_mask = exported["Servicio"].astype(str).eq("Lambda") if "Servicio" in exported.columns else False
+    if isinstance(lambda_mask, pd.Series) and lambda_mask.any():
+        exported.loc[lambda_mask, "Clasificacion uso Lambda"] = exported.loc[lambda_mask].apply(
+            lambda row: classify_lambda_usage(
+                row.get("Lambda last invoked at"),
+                row.get("Lambda usage status"),
+            ),
+            axis=1,
+        )
+        exported.loc[lambda_mask, "Detalle clasificacion Lambda"] = exported.loc[
+            lambda_mask,
+            "Clasificacion uso Lambda",
+        ].map(LAMBDA_USAGE_CLASSIFICATION_DETAILS).fillna("Revisar manualmente")
+
+    leading_columns = ["Clasificacion uso Lambda", "Detalle clasificacion Lambda"]
+    ordered_columns = leading_columns + [column for column in exported.columns if column not in leading_columns]
+    return exported[ordered_columns]
+
+
+def style_lambda_usage_classification(df):
+    """Aplica color suave a filas Lambda segun clasificacion de uso."""
+    if df is None or df.empty or "Clasificacion uso Lambda" not in df.columns:
+        return df
+
+    def format_integer_es(value):
+        if pd.isna(value):
+            return ""
+        try:
+            return f"{float(value):,.0f}".replace(",", ".")
+        except (TypeError, ValueError):
+            return value
+
+    def style_row(row):
+        classification = str(row.get("Clasificacion uso Lambda") or "")
+        color = LAMBDA_USAGE_CLASSIFICATION_COLORS.get(classification)
+        if not color:
+            return [""] * len(row)
+        return [
+            f"background-color: {color}" if column in {
+                "Clasificacion uso Lambda",
+                "Detalle clasificacion Lambda",
+                "Lambda last invoked at",
+                "Lambda invocations 30d",
+                "Lambda idle days",
+                "Lambda usage status",
+            } else ""
+            for column in row.index
+        ]
+
+    styled = df.style.apply(style_row, axis=1)
+    if "Lambda invocations 30d" in df.columns:
+        styled = styled.format({"Lambda invocations 30d": format_integer_es})
+    return styled
 
 
 def _selected_regions_for_scope(account_name, selected_region):
@@ -1009,7 +1462,7 @@ def build_coverage_dataframe(account_name, selected_region):
                 status = "Falta descargar"
             rows.append(
                 {
-                    "Cuenta": row.get("cuenta", account_name),
+                    "Cuenta": account_name,
                     "Region": region,
                     "Servicio": display_name,
                     "Tipo": "Global" if is_global else "Regional",
@@ -1066,7 +1519,59 @@ def _resource_identifier(row):
     return "Sin identificador"
 
 
-def build_tag_compliance_dataframe(account_name, selected_region):
+def _first_available_row_value(row, columns):
+    """Retorna el primer valor no vacio disponible en una fila."""
+    for column in columns:
+        if column not in row.index:
+            continue
+        value = row.get(column)
+        if pd.isna(value):
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {"none", "nan", "nat", "n/a"}:
+            return text
+    return ""
+
+
+def _component_last_usage(row):
+    """Obtiene la mejor senal disponible de ultimo llamado, uso o actividad."""
+    return _first_available_row_value(
+        row,
+        [
+            "ultima_invocacion",
+            "lambda_last_invoked_at",
+            "Lambda last invoked at",
+            "fecha_ultima_modificacion",
+            "ultima_modificacion",
+            "ultima_actualizacion",
+            "LastUpdated",
+            "last_updated",
+            "creacion",
+            "fecha_creacion",
+            "creationTime",
+            "launchTime",
+        ],
+    )
+
+
+def _build_lambda_last_usage_lookup(lambda_df):
+    """Indexa ultimos llamados Lambda por nombre y ARN."""
+    lookup = {}
+    if lambda_df is None or lambda_df.empty:
+        return lookup
+    for _, row in lambda_df.iterrows():
+        last_usage = _component_last_usage(row)
+        if not last_usage:
+            continue
+        for column in ["nombre", "arn"]:
+            value = row.get(column)
+            if value is not None and str(value).strip():
+                lookup[str(value).strip()] = last_usage
+    return lookup
+
+
+@st.cache_data(show_spinner=False)
+def build_tag_compliance_dataframe(account_name, selected_region, cache_version=None):
     """Construye analisis transversal de tags obligatorios."""
     rows = []
     for service_key, display_name, _ in ANALYTICS_SERVICE_LABELS:
@@ -1115,7 +1620,8 @@ def _get_numeric(row, columns, default=0):
     return default
 
 
-def build_billing_recommendations_dataframe(account_name, selected_region):
+@st.cache_data(show_spinner=False)
+def build_billing_recommendations_dataframe(account_name, selected_region, cache_version=None):
     """Genera hallazgos FinOps desde el inventario cacheado."""
     rows = []
 
@@ -1280,6 +1786,60 @@ def fetch_cost_explorer_dataframe(account_name):
     return pd.DataFrame(rows)
 
 
+def fetch_ec2_other_cost_breakdown_dataframe(account_name):
+    """Consulta Cost Explorer para desglosar EC2 - Other por tipo de uso."""
+    if account_name == ALL_ACCOUNTS_OPTION:
+        frames = []
+        for real_account in get_selected_account_names(account_name):
+            account_df = fetch_ec2_other_cost_breakdown_dataframe(real_account)
+            if not account_df.empty:
+                account_df["Cuenta"] = real_account
+                frames.append(account_df)
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    profile_name = PERFILES.get(account_name, {}).get("perfil")
+    if not profile_name:
+        return pd.DataFrame()
+
+    session = boto3.Session(profile_name=profile_name)
+    client = session.client("ce", region_name="us-east-1")
+    today = date.today()
+    end_date = today + timedelta(days=1)
+    start_month = (today.replace(day=1) - timedelta(days=90)).replace(day=1)
+
+    response = client.get_cost_and_usage(
+        TimePeriod={"Start": start_month.isoformat(), "End": end_date.isoformat()},
+        Granularity="MONTHLY",
+        Metrics=["UnblendedCost"],
+        Filter={"Dimensions": {"Key": "SERVICE", "Values": ["EC2 - Other"]}},
+        GroupBy=[
+            {"Type": "DIMENSION", "Key": "USAGE_TYPE"},
+            {"Type": "DIMENSION", "Key": "REGION"},
+        ],
+    )
+
+    rows = []
+    for period in response.get("ResultsByTime", []):
+        month = period.get("TimePeriod", {}).get("Start")
+        for group in period.get("Groups", []):
+            usage_type, region = (group.get("Keys") or ["Sin tipo de uso", "Sin region"])[:2]
+            metric = group.get("Metrics", {}).get("UnblendedCost", {})
+            rows.append(
+                {
+                    "Cuenta": account_name,
+                    "Mes": month,
+                    "Servicio": "EC2 - Other",
+                    "Usage Type": usage_type,
+                    "Region": region or "Global",
+                    "Costo USD": float(metric.get("Amount", 0)),
+                    "Moneda": metric.get("Unit", "USD"),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def _current_and_previous_months(cost_df):
     """Retorna etiquetas de mes actual y anterior segun datos consultados."""
     if cost_df.empty or "Mes" not in cost_df.columns:
@@ -1336,6 +1896,168 @@ def get_current_month_costs(cost_df):
     return cost_df[cost_df["Mes"] == current_month].copy()
 
 
+def classify_ec2_other_usage_type(usage_type):
+    """Agrupa usage types de EC2 - Other en componentes legibles."""
+    text = str(usage_type or "").lower()
+    if "snapshot" in text:
+        return "EBS Snapshots"
+    if "volumeusage" in text or "volume" in text or "gp2" in text or "gp3" in text or "io1" in text or "io2" in text:
+        return "EBS Volumes"
+    if "natgateway" in text or "nat-gateway" in text:
+        return "NAT Gateway"
+    if "eip" in text or "elasticip" in text or "publicipv4" in text:
+        return "Elastic IP / IPv4 publica"
+    if "data" in text or "bytes" in text or "regional" in text:
+        return "Transferencia de datos"
+    if "cpucredits" in text:
+        return "CPU Credits"
+    return "Otros EC2 - Other"
+
+
+def build_ec2_other_component_dataframe(ec2_other_df, selected_region):
+    """Agrupa el desglose real de EC2 - Other por componente y usage type."""
+    scoped_df = filter_costs_by_selected_scope(ec2_other_df, selected_region)
+    current_df = get_current_month_costs(scoped_df)
+    if current_df.empty:
+        return pd.DataFrame(columns=["Componente", "Usage Type", "Region", "Costo USD", "% EC2 - Other"])
+
+    current_df = current_df.copy()
+    current_df["Componente"] = current_df["Usage Type"].apply(classify_ec2_other_usage_type)
+    grouped = (
+        current_df.groupby(["Componente", "Usage Type", "Region"], as_index=False)["Costo USD"]
+        .sum()
+        .sort_values("Costo USD", ascending=False)
+    )
+    total = grouped["Costo USD"].sum()
+    grouped["% EC2 - Other"] = grouped["Costo USD"].apply(lambda value: (value / total * 100) if total else 0)
+    return grouped
+
+
+def _safe_float_value(value, default=0.0):
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _first_csv_value(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text.split(",", 1)[0].strip()
+
+
+def _lookup_product_for_inventory_row(row):
+    product_key, product_name, source, confidence = _infer_product_for_row(row)
+    return product_key, product_name or "Sin producto", source or "Sin evidencia", confidence or "Baja"
+
+
+def build_ec2_other_inventory_attribution_dataframe(account_name, selected_region, ec2_other_df, cache_version=None):
+    """Estima atribucion de EBS dentro de EC2 - Other usando inventario local."""
+    component_df = build_ec2_other_component_dataframe(ec2_other_df, selected_region)
+    if component_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Componente", "Producto", "EC2", "ID recurso", "Nombre recurso", "Region",
+                "Tamano GB", "Estado", "Costo estimado USD", "Confianza", "Base estimacion",
+            ]
+        )
+
+    component_totals = component_df.groupby("Componente")["Costo USD"].sum().to_dict()
+    volume_cost = float(component_totals.get("EBS Volumes", 0))
+    snapshot_cost = float(component_totals.get("EBS Snapshots", 0))
+
+    volumes_df = _load_service_scope_rows(account_name, selected_region, "ebs_volumes", "EBS Volumes")
+    snapshots_df = _load_service_scope_rows(account_name, selected_region, "ebs_snapshots", "EBS Snapshots")
+    ec2_df = _load_service_scope_rows(account_name, selected_region, "ec2", "EC2")
+
+    instance_lookup = {}
+    for _, ec2_row in ec2_df.iterrows():
+        instance_id = str(ec2_row.get("id") or "").strip()
+        if not instance_id:
+            continue
+        instance_lookup[(ec2_row.get("cuenta", account_name), ec2_row.get("region", ""), instance_id)] = ec2_row
+
+    volume_lookup = {}
+    for _, volume_row in volumes_df.iterrows():
+        volume_id = str(volume_row.get("id") or "").strip()
+        if not volume_id:
+            continue
+        volume_lookup[(volume_row.get("cuenta", account_name), volume_row.get("region", ""), volume_id)] = volume_row
+
+    rows = []
+    if not volumes_df.empty and volume_cost > 0:
+        volumes_df = volumes_df.copy()
+        volumes_df["Tamano GB"] = volumes_df["size_gb"].apply(_safe_float_value)
+        total_gb = volumes_df["Tamano GB"].sum()
+        for _, volume_row in volumes_df.iterrows():
+            account = volume_row.get("cuenta", account_name)
+            region = volume_row.get("region", "")
+            instance_id = _first_csv_value(volume_row.get("attached_instance_id"))
+            instance_row = instance_lookup.get((account, region, instance_id))
+            source_row = instance_row if instance_row is not None else volume_row
+            _, product_name, product_source, product_confidence = _lookup_product_for_inventory_row(source_row)
+            ec2_name = instance_row.get("nombre") if instance_row is not None else ""
+            size_gb = _safe_float_value(volume_row.get("size_gb"))
+            rows.append(
+                {
+                    "Componente": "EBS Volumes",
+                    "Producto": product_name,
+                    "EC2": ec2_name or instance_id or "Sin EC2 asociada",
+                    "ID recurso": volume_row.get("id"),
+                    "Nombre recurso": volume_row.get("nombre"),
+                    "Region": region,
+                    "Tamano GB": size_gb,
+                    "Estado": volume_row.get("estado"),
+                    "Costo estimado USD": (volume_cost * size_gb / total_gb) if total_gb else 0,
+                    "Confianza": "Media" if instance_id else "Baja",
+                    "Base estimacion": f"Prorrateo por GB de volumen; producto por {product_source} ({product_confidence})",
+                }
+            )
+
+    if not snapshots_df.empty and snapshot_cost > 0:
+        snapshots_df = snapshots_df.copy()
+        snapshots_df["Tamano GB"] = snapshots_df["volume_size_gb"].apply(_safe_float_value)
+        total_snapshot_gb = snapshots_df["Tamano GB"].sum()
+        for _, snapshot_row in snapshots_df.iterrows():
+            account = snapshot_row.get("cuenta", account_name)
+            region = snapshot_row.get("region", "")
+            volume_id = str(snapshot_row.get("volume_id") or "").strip()
+            volume_row = volume_lookup.get((account, region, volume_id))
+            instance_id = _first_csv_value(volume_row.get("attached_instance_id")) if volume_row is not None else ""
+            instance_row = instance_lookup.get((account, region, instance_id))
+            source_row = instance_row if instance_row is not None else volume_row if volume_row is not None else snapshot_row
+            _, product_name, product_source, product_confidence = _lookup_product_for_inventory_row(source_row)
+            ec2_name = instance_row.get("nombre") if instance_row is not None else ""
+            size_gb = _safe_float_value(snapshot_row.get("volume_size_gb"))
+            rows.append(
+                {
+                    "Componente": "EBS Snapshots",
+                    "Producto": product_name,
+                    "EC2": ec2_name or instance_id or "Sin EC2 asociada",
+                    "ID recurso": snapshot_row.get("id"),
+                    "Nombre recurso": snapshot_row.get("nombre"),
+                    "Region": region,
+                    "Tamano GB": size_gb,
+                    "Estado": snapshot_row.get("estado"),
+                    "Costo estimado USD": (snapshot_cost * size_gb / total_snapshot_gb) if total_snapshot_gb else 0,
+                    "Confianza": "Media" if instance_id else "Baja",
+                    "Base estimacion": f"Prorrateo por GB de snapshot; producto por {product_source} ({product_confidence})",
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "Componente", "Producto", "EC2", "ID recurso", "Nombre recurso", "Region",
+                "Tamano GB", "Estado", "Costo estimado USD", "Confianza", "Base estimacion",
+            ]
+        )
+    return pd.DataFrame(rows).sort_values("Costo estimado USD", ascending=False)
+
+
 def map_cost_service_to_inventory_service(service_name):
     """Mapea nombres de Cost Explorer a servicios del inventario para estimaciones."""
     text = str(service_name or "").lower()
@@ -1374,9 +2096,9 @@ def build_cost_by_service_dataframe(cost_df):
     return grouped
 
 
-def build_estimated_product_cost_dataframe(account_name, selected_region, cost_df):
+def build_estimated_product_cost_dataframe(account_name, selected_region, cost_df, cache_version=None):
     """Estima costo por producto distribuyendo costo por servicio segun recursos detectados."""
-    product_df = build_product_inventory_dataframe(account_name, selected_region)
+    product_df = build_product_inventory_dataframe(account_name, selected_region, cache_version)
     current_df = get_current_month_costs(filter_costs_by_selected_scope(cost_df, selected_region))
     if product_df.empty or current_df.empty:
         return pd.DataFrame(columns=["Producto", "Recursos", "Costo Mensual USD", "% del Total", "Metodo"])
@@ -1530,7 +2252,8 @@ def get_vulnerability_management_defaults(row, extraction_time):
     }
 
 
-def build_vulnerability_dataframe(account_name, selected_region):
+@st.cache_data(show_spinner=False)
+def build_vulnerability_dataframe(account_name, selected_region, cache_version=None):
     """Genera hallazgos de version/configuracion desde inventario disponible."""
     rows = []
 
@@ -1558,6 +2281,10 @@ def build_vulnerability_dataframe(account_name, selected_region):
                     "Exploit disponible": "No evaluado",
                     "Lambda package type": row.get("package_type", ""),
                     "Lambda last updated at": row.get("ultima_modificacion", ""),
+                    "Lambda last invoked at": row.get("ultima_invocacion", ""),
+                    "Lambda invocations 30d": row.get("invocaciones_30d", ""),
+                    "Lambda idle days": row.get("dias_desde_ultima_invocacion", ""),
+                    "Lambda usage status": row.get("estado_uso", ""),
                     "Accion recomendada": LAMBDA_RUNTIME_UPGRADE_ACTION,
                     "Evidencia requerida": LAMBDA_RUNTIME_EVIDENCE,
                     "Prioridad": "Alta",
@@ -1583,6 +2310,10 @@ def build_vulnerability_dataframe(account_name, selected_region):
                     "Exploit disponible": "No aplica",
                     "Lambda package type": row.get("package_type", ""),
                     "Lambda last updated at": row.get("ultima_modificacion", ""),
+                    "Lambda last invoked at": row.get("ultima_invocacion", ""),
+                    "Lambda invocations 30d": row.get("invocaciones_30d", ""),
+                    "Lambda idle days": row.get("dias_desde_ultima_invocacion", ""),
+                    "Lambda usage status": row.get("estado_uso", ""),
                     "Accion recomendada": "Revisar el ultimo despliegue y confirmar que la funcion queda en Successful.",
                     "Evidencia requerida": "Estado Successful en Lambda y ejecucion de prueba correcta.",
                     "Prioridad": "Media",
@@ -1783,7 +2514,8 @@ def _infer_product_for_row(row):
     return "", "", "", ""
 
 
-def build_product_inventory_dataframe(account_name, selected_region):
+@st.cache_data(show_spinner=False)
+def build_product_inventory_dataframe(account_name, selected_region, cache_version=None):
     """Agrupa recursos en productos sugeridos sin persistir cambios."""
     rows = []
     for service_key, display_name, _ in ANALYTICS_SERVICE_LABELS:
@@ -1805,6 +2537,7 @@ def build_product_inventory_dataframe(account_name, selected_region):
                     "Producto": product_name,
                     "Servicio": display_name,
                     "Recurso": _resource_identifier(row),
+                    "Ultimo llamado / uso": _component_last_usage(row),
                     "Origen deteccion": source,
                     "Confianza": confidence,
                 }
@@ -1819,6 +2552,7 @@ def build_product_inventory_dataframe(account_name, selected_region):
                 "Producto",
                 "Servicio",
                 "Recurso",
+                "Ultimo llamado / uso",
                 "Origen deteccion",
                 "Confianza",
             ]
@@ -1826,9 +2560,12 @@ def build_product_inventory_dataframe(account_name, selected_region):
     return pd.DataFrame(rows)
 
 
-def build_product_relationships_dataframe(account_name, selected_region):
+@st.cache_data(show_spinner=False)
+def build_product_relationships_dataframe(account_name, selected_region, cache_version=None):
     """Detecta relaciones conocidas entre servicios cacheados."""
     rows = []
+    lambda_df = _load_service_scope_rows(account_name, selected_region, "lambda", "Lambda")
+    lambda_last_usage_lookup = _build_lambda_last_usage_lookup(lambda_df)
     routes_df = _load_service_scope_rows(
         account_name,
         selected_region,
@@ -1840,6 +2577,7 @@ def build_product_relationships_dataframe(account_name, selected_region):
             product_key, product_name, source, confidence = _infer_product_for_row(row)
             if not product_key:
                 continue
+            lambda_target = row.get("lambda_function", row.get("lambda_arn", ""))
             rows.append(
                 {
                     "Cuenta": account_name,
@@ -1848,7 +2586,11 @@ def build_product_relationships_dataframe(account_name, selected_region):
                     "Producto": product_name,
                     "Relacion": "API Gateway -> Lambda",
                     "Origen": row.get("api_nombre", row.get("api_id", "")),
-                    "Destino": row.get("lambda_function", row.get("lambda_arn", "")),
+                    "Destino": lambda_target,
+                    "Ultimo llamado / uso": lambda_last_usage_lookup.get(
+                        str(lambda_target).strip(),
+                        lambda_last_usage_lookup.get(str(row.get("lambda_arn", "")).strip(), ""),
+                    ),
                     "Detalle": row.get("route_key", row.get("ruta", "")),
                     "Evidencia": "Integracion API Gateway",
                     "Confianza": "Alta" if confidence != "Alta" else confidence,
@@ -1856,13 +2598,13 @@ def build_product_relationships_dataframe(account_name, selected_region):
                 }
             )
 
-    lambda_df = _load_service_scope_rows(account_name, selected_region, "lambda", "Lambda")
     if not lambda_df.empty:
         for _, row in lambda_df.iterrows():
             product_key, product_name, source, confidence = _infer_product_for_row(row)
             if not product_key:
                 continue
             role_name = row.get("execution_role_name") or row.get("execution_role_arn")
+            lambda_last_usage = _component_last_usage(row)
             if role_name:
                 rows.append(
                     {
@@ -1873,6 +2615,7 @@ def build_product_relationships_dataframe(account_name, selected_region):
                         "Relacion": "Lambda -> IAM Role",
                         "Origen": row.get("nombre", ""),
                         "Destino": role_name,
+                        "Ultimo llamado / uso": lambda_last_usage,
                         "Detalle": row.get("access_actions", ""),
                         "Evidencia": "Rol de ejecucion Lambda",
                         "Confianza": confidence,
@@ -1889,6 +2632,7 @@ def build_product_relationships_dataframe(account_name, selected_region):
                         "Relacion": "Lambda -> VPC",
                         "Origen": row.get("nombre", ""),
                         "Destino": row.get("vpc", ""),
+                        "Ultimo llamado / uso": lambda_last_usage,
                         "Detalle": row.get("subnets", ""),
                         "Evidencia": "Configuracion VPC Lambda",
                         "Confianza": confidence,
@@ -1906,6 +2650,7 @@ def build_product_relationships_dataframe(account_name, selected_region):
                 "Relacion",
                 "Origen",
                 "Destino",
+                "Ultimo llamado / uso",
                 "Detalle",
                 "Evidencia",
                 "Confianza",
@@ -1979,6 +2724,296 @@ def build_product_summary_dataframe(product_df, relationships_df):
     return pd.DataFrame(rows).sort_values(
         by=["Recursos", "Relaciones", "Producto"],
         ascending=[False, False, True],
+        kind="stable",
+    )
+
+
+DRP_STATUS_RANK = {
+    "Bloqueado": 5,
+    "Parcial": 4,
+    "Dudoso": 3,
+    "Solo Ohio": 2,
+    "Listo aparente": 1,
+    "Sin clasificar": 0,
+}
+DRP_STATUS_COLORS = {
+    "Bloqueado": "#dc2626",
+    "Parcial": "#d97706",
+    "Dudoso": "#ca8a04",
+    "Solo Ohio": "#64748b",
+    "Listo aparente": "#16a34a",
+    "Sin clasificar": "#94a3b8",
+}
+DRP_CRITICAL_SERVICES = {"rds", "lambda", "api_gateway", "ssm", "kms", "dynamodb", "sqs"}
+DRP_SERVICE_ACTIONS = {
+    "ec2": "Validar AMI, subnet, security groups, IAM role y capacidad de encendido en Ohio.",
+    "rds": "Definir replica, snapshot restaurable o procedimiento de restore probado en Ohio.",
+    "vpc": "Validar CIDR, subnets, rutas, security groups y conectividad requerida.",
+    "vpc_outbound_ips": "Validar NAT, EIP e IPs de salida usadas en allowlists de terceros.",
+    "lambda": "Replicar funcion, runtime, variables, layers, rol, VPC config y alias/version.",
+    "api_gateway": "Validar rutas, stages, integraciones Lambda, dominios y certificados.",
+    "cloudformation": "Revisar IaC/stacks para desplegar o mantener el producto en ambas regiones.",
+    "ssm": "Replicar parametros/configuracion y validar cifrado KMS.",
+    "kms": "Validar alias, key policy, permisos y disponibilidad regional.",
+    "dynamodb": "Validar Global Tables, backups/PITR o restauracion y modo de capacidad.",
+    "sqs": "Validar cola, DLQ, FIFO, policy y cifrado KMS.",
+}
+
+
+def infer_environment_from_text(value):
+    """Clasifica ambiente sugerido desde convenciones de nombre."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return "desconocido", "Sin marcador"
+
+    tokens = [token for token in re.split(r"[^a-z0-9]+", text) if token]
+    token_set = set(tokens)
+    if token_set & {"prod", "prd", "production", "produccion"}:
+        return "prod", "Nombre"
+    if token_set & {"cert", "certification", "certificacion", "qa", "uat"}:
+        return "cert", "Nombre"
+    if token_set & {"dev", "des", "development", "test", "testing"}:
+        return "no-prod", "Nombre"
+    return "desconocido", "Sin marcador"
+
+
+def infer_environment_for_row(row):
+    """Busca el mejor texto disponible para inferir ambiente de un recurso."""
+    for column in [
+        "api_nombre",
+        "lambda_function",
+        "nombre",
+        "name",
+        "id",
+        "resource_id",
+        "arn",
+        "url",
+    ]:
+        if column not in row.index:
+            continue
+        environment, source = infer_environment_from_text(row.get(column))
+        if environment != "desconocido":
+            return environment, source
+    return "desconocido", "Sin marcador"
+
+
+def _drp_service_meta_by_key():
+    return {service_meta["key"]: service_meta for service_meta in REGIONAL_COMPARISON_SERVICES}
+
+
+def _drp_component_records(account_name, region, service_meta):
+    service_key = service_meta["key"]
+    data, is_fresh, exists = load_cached_dataframe(account_name, region, service_key)
+    records = {}
+    duplicate_count = 0
+
+    if data is None or data.empty:
+        return records, is_fresh, exists, duplicate_count
+
+    for _, row in data.iterrows():
+        product_key, product_name, product_source, product_confidence = _infer_product_for_row(row)
+        resource_name = get_first_available_value(
+            row,
+            service_meta.get("name_columns", []) + ["nombre", "name", "id", "resource_id", "arn", "url"],
+        )
+        component_key = normalize_component_name(resource_name)
+        if not product_key or not component_key:
+            continue
+
+        environment, environment_source = infer_environment_for_row(row)
+        record_key = (product_key, service_key, component_key)
+        if record_key in records:
+            duplicate_count += 1
+            continue
+
+        records[record_key] = {
+            "product_key": product_key,
+            "product_name": product_name,
+            "product_source": product_source,
+            "product_confidence": product_confidence,
+            "service_key": service_key,
+            "service_label": service_meta["label"],
+            "component_key": component_key,
+            "resource_name": resource_name or _resource_identifier(row),
+            "environment": environment,
+            "environment_source": environment_source,
+            "config": build_config_summary(row, service_meta.get("config_columns", [])),
+        }
+
+    return records, is_fresh, exists, duplicate_count
+
+
+def classify_drp_pair(left_record, right_record):
+    """Clasifica una comparacion Virginia -> Ohio para el MVP DRP."""
+    if left_record and not right_record:
+        return "Bloqueado", "No se detecta equivalente en Ohio."
+    if right_record and not left_record:
+        return "Solo Ohio", "Existe en Ohio sin equivalente en Virginia."
+    if not left_record and not right_record:
+        return "Sin clasificar", "No hay evidencia comparable."
+
+    left_env = left_record.get("environment", "desconocido")
+    right_env = right_record.get("environment", "desconocido")
+    same_config = left_record.get("config") == right_record.get("config")
+
+    if left_env == "prod" and right_env == "cert":
+        if same_config:
+            return "Dudoso", "Ohio existe, pero el nombre lo declara como cert."
+        return "Parcial", "Ohio existe como cert y la configuracion principal difiere."
+    if left_env == "prod" and right_env not in {"prod", "desconocido"}:
+        return "Dudoso", f"Ambiente Ohio detectado como {right_env}."
+    if not same_config:
+        return "Parcial", "Existe en ambas regiones, pero la configuracion principal difiere."
+    if left_env == "desconocido" or right_env == "desconocido":
+        return "Dudoso", "Existe en ambas regiones, pero falta marcador de ambiente."
+    return "Listo aparente", "Existe en ambas regiones y la configuracion principal coincide."
+
+
+def drp_action_for_status(service_key, status):
+    service_action = DRP_SERVICE_ACTIONS.get(service_key, "Validar configuracion y dependencia operacional.")
+    if status == "Bloqueado":
+        return f"Replicar o definir alternativa en Ohio. {service_action}"
+    if status == "Parcial":
+        return f"Corregir diferencias antes de prueba DRP. {service_action}"
+    if status == "Dudoso":
+        return f"Confirmar si Ohio es DR productivo o cert. {service_action}"
+    if status == "Solo Ohio":
+        return "Revisar si es recurso de certificacion, prueba o componente requerido para failback."
+    if status == "Listo aparente":
+        return "Candidato a prueba controlada; validar funcionalmente."
+    return "Mejorar nombre o evidencia para clasificar."
+
+
+@st.cache_data(show_spinner=False)
+def build_drp_analysis_dataframe(account_name, left_region, right_region, cache_version=None):
+    """Construye evidencia DRP por producto usando nombres y cache local."""
+    rows = []
+    service_meta_by_key = _drp_service_meta_by_key()
+
+    for service_key in service_meta_by_key:
+        service_meta = service_meta_by_key[service_key]
+        left_records, left_fresh, left_exists, left_duplicates = _drp_component_records(
+            account_name, left_region, service_meta
+        )
+        right_records, right_fresh, right_exists, right_duplicates = _drp_component_records(
+            account_name, right_region, service_meta
+        )
+
+        for record_key in sorted(set(left_records.keys()) | set(right_records.keys())):
+            left_record = left_records.get(record_key)
+            right_record = right_records.get(record_key)
+            source_record = left_record or right_record
+            status, observation = classify_drp_pair(left_record, right_record)
+            service_key = source_record["service_key"]
+            impact = "Alto" if status in {"Bloqueado", "Parcial"} and service_key in DRP_CRITICAL_SERVICES else "Medio"
+            if status in {"Listo aparente", "Solo Ohio"}:
+                impact = "Bajo"
+            confidence = source_record.get("product_confidence", "Baja")
+            if source_record.get("environment") == "desconocido":
+                confidence = "Baja"
+
+            rows.append(
+                {
+                    "Producto key": source_record["product_key"],
+                    "Producto": source_record["product_name"],
+                    "Servicio key": service_key,
+                    "Servicio": source_record["service_label"],
+                    "Componente base": source_record["component_key"],
+                    "Virginia": left_record.get("resource_name") if left_record else "No existe",
+                    "Ohio": right_record.get("resource_name") if right_record else "No existe",
+                    "Ambiente Virginia": left_record.get("environment") if left_record else "",
+                    "Ambiente Ohio": right_record.get("environment") if right_record else "",
+                    "Estado DRP": status,
+                    "Impacto": impact,
+                    "Observacion": observation,
+                    "Accion sugerida": drp_action_for_status(service_key, status),
+                    "Confianza": confidence,
+                    "Config Virginia": left_record.get("config") if left_record else "No existe",
+                    "Config Ohio": right_record.get("config") if right_record else "No existe",
+                    "Cache Virginia": "Fresco" if left_fresh else "Viejo" if left_exists else "Sin datos",
+                    "Cache Ohio": "Fresco" if right_fresh else "Viejo" if right_exists else "Sin datos",
+                    "Duplicados Virginia": left_duplicates,
+                    "Duplicados Ohio": right_duplicates,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "Producto key",
+                "Producto",
+                "Servicio",
+                "Componente base",
+                "Virginia",
+                "Ohio",
+                "Ambiente Virginia",
+                "Ambiente Ohio",
+                "Estado DRP",
+                "Impacto",
+                "Observacion",
+                "Accion sugerida",
+                "Confianza",
+            ]
+        )
+    return pd.DataFrame(rows)
+
+
+def build_drp_product_summary_dataframe(drp_df):
+    """Agrega el analisis DRP a nivel producto."""
+    if drp_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Producto key",
+                "Producto",
+                "Estado DRP",
+                "Readiness",
+                "Componentes",
+                "Bloqueados",
+                "Parciales",
+                "Dudosos",
+                "Listos aparentes",
+                "Servicios",
+                "Accion principal",
+            ]
+        )
+
+    rows = []
+    for product_key, product_rows in drp_df.groupby("Producto key", dropna=False):
+        statuses = product_rows["Estado DRP"].fillna("Sin clasificar").tolist()
+        worst_status = max(statuses, key=lambda status: DRP_STATUS_RANK.get(status, 0))
+        total = len(product_rows)
+        blocking = int((product_rows["Estado DRP"] == "Bloqueado").sum())
+        partial = int((product_rows["Estado DRP"] == "Parcial").sum())
+        doubtful = int((product_rows["Estado DRP"] == "Dudoso").sum())
+        ready = int((product_rows["Estado DRP"] == "Listo aparente").sum())
+        readiness = round((ready + int((product_rows["Estado DRP"] == "Solo Ohio").sum()) * 0.25) / total * 100) if total else 0
+        action_rows = product_rows[
+            product_rows["Estado DRP"].isin(["Bloqueado", "Parcial", "Dudoso"])
+        ]
+        action = (
+            action_rows.iloc[0]["Accion sugerida"]
+            if not action_rows.empty
+            else "Candidato a prueba controlada; validar funcionalmente."
+        )
+        rows.append(
+            {
+                "Producto key": product_key,
+                "Producto": product_rows.iloc[0].get("Producto", _humanize_product_name(product_key)),
+                "Estado DRP": worst_status,
+                "Readiness": readiness,
+                "Componentes": total,
+                "Bloqueados": blocking,
+                "Parciales": partial,
+                "Dudosos": doubtful,
+                "Listos aparentes": ready,
+                "Servicios": ", ".join(sorted(product_rows["Servicio"].dropna().unique())),
+                "Accion principal": action,
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values(
+        by=["Bloqueados", "Parciales", "Dudosos", "Readiness", "Producto"],
+        ascending=[False, False, False, True, True],
         kind="stable",
     )
 
@@ -2783,6 +3818,14 @@ st.markdown(
         left: 0;
         background: {theme["panel_bg"]};
     }}
+    table.account-comparison-table tbody tr:last-child td {{
+        background: {theme["panel_bg"]} !important;
+        font-weight: 700;
+    }}
+    table.account-comparison-table tbody tr:last-child td:first-child {{
+        background: {theme["panel_bg"]} !important;
+        font-weight: 700;
+    }}
     .account-comparison-wrapper {{
         width: 100%;
         overflow-x: auto;
@@ -2868,6 +3911,7 @@ page = st.sidebar.radio(
         "Tags",
         "Billing",
         "Vulnerabilidades",
+        "DRP",
         "Comparacion Regional",
     ],
 )
@@ -2962,6 +4006,8 @@ if st.sidebar.button("Archivo .xlsx seleccion actual", use_container_width=True)
             selected_export_accounts,
             PERFILES,
             str(excel_output_path),
+            discovery=load_discovery_cached(),
+            selected_region=selected_region,
         )
         if generated_path and excel_output_path.exists():
             st.session_state["excel_download_data"] = excel_output_path.read_bytes()
@@ -2975,11 +4021,20 @@ if st.sidebar.button("Archivo .xlsx seleccion actual", use_container_width=True)
 if st.sidebar.button("Archivo .xlsx total", use_container_width=True):
     try:
         excel_output_path = build_excel_export_path("inventario_global")
+        global_vulnerability_df = build_vulnerability_dataframe(
+            ALL_ACCOUNTS_OPTION,
+            ALL_REGIONS_OPTION,
+            get_analytics_cache_version(ALL_ACCOUNTS_OPTION, ALL_REGIONS_OPTION),
+        )
+        global_vulnerability_df = add_lambda_usage_classification_for_export(global_vulnerability_df)
         generated_path = export_to_excel(
             cache_manager,
             account_names,
             PERFILES,
             str(excel_output_path),
+            discovery=load_discovery_cached(),
+            selected_region=ALL_REGIONS_OPTION,
+            vulnerability_df=global_vulnerability_df,
         )
         if generated_path and excel_output_path.exists():
             st.session_state["excel_download_data"] = excel_output_path.read_bytes()
@@ -2999,13 +4054,42 @@ if st.session_state.get("excel_download_data"):
         use_container_width=True,
     )
 
-if st.sidebar.button("Limpiar Cache", use_container_width=True):
-    cache_manager.clear()
-    st.success("Cache limpiado")
+if "confirm_clear_cache" not in st.session_state:
+    st.session_state["confirm_clear_cache"] = False
+if "clear_cache_confirmation_nonce" not in st.session_state:
+    st.session_state["clear_cache_confirmation_nonce"] = 0
+
+if not st.session_state["confirm_clear_cache"]:
+    if st.sidebar.button("Limpiar Cache", use_container_width=True):
+        st.session_state["confirm_clear_cache"] = True
+        st.rerun()
+else:
+    st.sidebar.warning("Esta accion elimina todo el cache local descargado.")
+    clear_cache_confirmation = st.sidebar.text_input(
+        "Escribe ELIMINAR CACHE para confirmar",
+        key=f"clear_cache_confirmation_{st.session_state['clear_cache_confirmation_nonce']}",
+    )
+    confirm_col, cancel_col = st.sidebar.columns(2)
+    with confirm_col:
+        if st.button(
+            "Confirmar",
+            disabled=clear_cache_confirmation.strip() != "ELIMINAR CACHE",
+            use_container_width=True,
+        ):
+            cache_manager.clear()
+            st.session_state["confirm_clear_cache"] = False
+            st.session_state["clear_cache_confirmation_nonce"] += 1
+            st.success("Cache limpiado")
+            st.rerun()
+    with cancel_col:
+        if st.button("Cancelar", use_container_width=True):
+            st.session_state["confirm_clear_cache"] = False
+            st.session_state["clear_cache_confirmation_nonce"] += 1
+            st.rerun()
 
 st.sidebar.divider()
 st.sidebar.subheader("Estado del Cache")
-cache_status = get_cache_status()
+cache_status = load_cache_status_cached()
 col1, col2 = st.sidebar.columns(2)
 with col1:
     st.metric("Archivos", cache_status["cache_files"])
@@ -3020,38 +4104,51 @@ else:
 if page == "Dashboard":
     st.title("Dashboard Global")
 
-    tab1, tab2 = st.tabs(["Cuenta Actual", "Todas las Cuentas"])
+    dashboard_view = st.radio(
+        "Vista dashboard",
+        ["Cuenta Actual", "Todas las Cuentas"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-    with tab1:
+    if dashboard_view == "Cuenta Actual":
         st.subheader(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
         if selected_region == ALL_REGIONS_OPTION:
             st.caption("Resumen consolidado de todas las regiones descubiertas y cacheadas para la cuenta.")
 
-        metrics_data = {}
-        for service_key, display_name in SERVICE_LABELS:
-            service_df, status, exists = load_account_service_dataframe(
-                selected_account,
-                service_key,
-                selected_region,
-            )
-            count = len(service_df) if exists and isinstance(service_df, pd.DataFrame) else 0
-            metrics_data[display_name] = (count, status)
-
-        total_components = sum(count for count, _ in metrics_data.values())
-        dashboard_metrics = {
-            "Total componentes": (total_components, selected_region_label),
-            **metrics_data,
+        dashboard_scope = resolve_inventory_scope(
+            PERFILES,
+            load_discovery_cached(),
+            selected_account,
+            selected_region,
+            DASHBOARD_SERVICE_CONFIG,
+        )
+        dashboard_count_rows = build_dashboard_count_rows(load_cached_dataframe, dashboard_scope)
+        metrics_data = {
+            row["Servicio"]: (row["Conteo Dashboard"], row["Estado cache"])
+            for row in dashboard_count_rows
         }
 
-        cols = st.columns(5)
-        for idx, (display_name, (count, status)) in enumerate(dashboard_metrics.items()):
-            with cols[idx % 5]:
-                st.metric(display_name, count, delta=status)
+        total_components = sum(count for count, _ in metrics_data.values())
+        sorted_metrics = sorted(
+            metrics_data.items(),
+            key=lambda item: item[1][0],
+            reverse=True,
+        )
+        dashboard_metric_items = [("Total componentes", total_components, selected_region_label)]
+        dashboard_metric_items.extend(
+            (display_name, count, status)
+            for display_name, (count, status) in sorted_metrics
+        )
+        render_metric_cards(dashboard_metric_items)
 
         if selected_region == ALL_REGIONS_OPTION:
             if selected_account == ALL_ACCOUNTS_OPTION:
                 region_summary_frames = [
-                    build_account_region_summary(account)
+                    build_account_region_summary(
+                        account,
+                        get_cache_scope_version(account, ALL_REGIONS_OPTION, REGION_SUMMARY_SERVICE_KEYS),
+                    )
                     for account in get_selected_account_names(selected_account)
                 ]
                 region_summary_df = (
@@ -3060,8 +4157,15 @@ if page == "Dashboard":
                     else pd.DataFrame()
                 )
             else:
-                region_summary_df = build_account_region_summary(selected_account)
+                region_summary_df = build_account_region_summary(
+                    selected_account,
+                    get_cache_scope_version(selected_account, ALL_REGIONS_OPTION, REGION_SUMMARY_SERVICE_KEYS),
+                )
             if not region_summary_df.empty:
+                region_summary_df = region_summary_df.sort_values(
+                    ["Total recursos", "Cuenta", "Region"],
+                    ascending=[False, True, True],
+                )
                 st.subheader("Cobertura por Region")
                 display_region_summary_df = sanitize_dataframe_for_display(region_summary_df)
                 st.markdown(
@@ -3081,72 +4185,27 @@ if page == "Dashboard":
                 fig = style_plotly_figure(fig, theme_name)
                 st.plotly_chart(fig, use_container_width=True)
 
-    with tab2:
+    if dashboard_view == "Todas las Cuentas":
         st.subheader("Resumen Global")
 
-        totals = {
-            "EC2": 0,
-            "RDS": 0,
-            "VPC": 0,
-            "NAT/IPs": 0,
-            "S3": 0,
-            "Lambda": 0,
-            "API": 0,
-            "CloudFormation": 0,
-            "SSM": 0,
-            "KMS": 0,
-            "DynamoDB": 0,
-            "SQS": 0,
-            "IAM": 0,
-            "Total componentes": 0,
-        }
+        service_labels = [service["label"] for service in DASHBOARD_SERVICE_CONFIG]
+        totals = {label: 0 for label in service_labels}
+        totals["Total componentes"] = 0
 
         account_data = []
 
         for account in account_names:
-            acc_data = {
-                "Cuenta": account,
-                "EC2": 0,
-                "RDS": 0,
-                "VPC": 0,
-                "NAT/IPs": 0,
-                "S3": 0,
-                "Lambda": 0,
-                "API": 0,
-                "CloudFormation": 0,
-                "SSM": 0,
-                "KMS": 0,
-                "DynamoDB": 0,
-                "SQS": 0,
-                "IAM": 0,
-                "Total componentes": 0,
-            }
-
-            regional_services = [
-                ("ec2", "EC2"),
-                ("rds", "RDS"),
-                ("vpc", "VPC"),
-                ("vpc_outbound_ips", "NAT/IPs"),
-                ("lambda", "Lambda"),
-                ("api_gateway", "API"),
-                ("cloudformation", "CloudFormation"),
-                ("ssm", "SSM"),
-                ("kms", "KMS"),
-                ("dynamodb", "DynamoDB"),
-                ("sqs", "SQS"),
-            ]
-
-            for region in get_prioritized_regions(account):
-                for svc, key in regional_services:
-                    data, _, exists = cache_manager.get(account, region, svc)
-                    if exists and isinstance(data, pd.DataFrame):
-                        acc_data[key] += len(data)
-
-            global_region = get_global_region(account)
-            for svc, key in [("s3", "S3"), ("iam_users", "IAM")]:
-                data, _, exists = cache_manager.get(account, global_region, svc)
-                if exists and isinstance(data, pd.DataFrame):
-                    acc_data[key] = len(data)
+            account_scope = resolve_inventory_scope(
+                PERFILES,
+                load_discovery_cached(),
+                account,
+                ALL_REGIONS_OPTION,
+                DASHBOARD_SERVICE_CONFIG,
+            )
+            account_count_rows = build_dashboard_count_rows(load_cached_dataframe, account_scope)
+            acc_data = {"Cuenta": account, **{label: 0 for label in service_labels}, "Total componentes": 0}
+            for row in account_count_rows:
+                acc_data[row["Servicio"]] = row["Conteo Dashboard"]
 
             acc_data["Total componentes"] = sum(
                 value for key, value in acc_data.items() if key != "Cuenta"
@@ -3157,45 +4216,35 @@ if page == "Dashboard":
             for key in totals:
                 totals[key] += acc_data[key]
 
-        col1, col2, col3, col4, col5 = st.columns(5)
-        with col1:
-            st.metric("Total componentes", totals["Total componentes"])
-        with col2:
-            st.metric("EC2", totals["EC2"])
-        with col3:
-            st.metric("RDS", totals["RDS"])
-        with col4:
-            st.metric("VPC", totals["VPC"])
-        with col5:
-            st.metric("S3", totals["S3"])
-
-        col1, col2, col3, col4, col5 = st.columns(5)
-        with col1:
-            st.metric("Lambda", totals["Lambda"])
-        with col2:
-            st.metric("API GW", totals["API"])
-        with col3:
-            st.metric("CloudFormation", totals["CloudFormation"])
-        with col4:
-            st.metric("SSM", totals["SSM"])
-        with col5:
-            st.metric("KMS", totals["KMS"])
-
-        col1, col2, col3, col4, col5 = st.columns(5)
-        with col1:
-            st.metric("DynamoDB", totals["DynamoDB"])
-        with col2:
-            st.metric("SQS", totals["SQS"])
-        with col3:
-            st.metric("NAT/IPs", totals["NAT/IPs"])
-        with col4:
-            st.metric("IAM", totals["IAM"])
-        with col5:
-            st.empty()
+        global_metric_items = [("Total componentes", totals["Total componentes"], "")]
+        global_metric_items.extend(
+            (display_name, totals[display_name], "")
+            for display_name in sorted(
+                [key for key in totals if key != "Total componentes"],
+                key=lambda key: totals[key],
+                reverse=True,
+            )
+        )
+        render_metric_cards(global_metric_items)
 
         st.subheader("Comparativa por Cuenta")
         if account_data:
-            df_comp = pd.DataFrame(account_data)
+            df_comp = pd.DataFrame(account_data).sort_values(
+                "Total componentes",
+                ascending=False,
+                kind="stable",
+            )
+            ordered_service_columns = sorted(
+                [key for key in totals if key != "Total componentes"],
+                key=lambda key: totals[key],
+                reverse=True,
+            )
+            df_comp = df_comp[["Cuenta", *ordered_service_columns, "Total componentes"]]
+            total_row = {"Cuenta": "Total"}
+            for column in df_comp.columns:
+                if column != "Cuenta":
+                    total_row[column] = df_comp[column].sum()
+            df_comp = pd.concat([df_comp, pd.DataFrame([total_row])], ignore_index=True)
             formatters = {}
             for column in df_comp.columns:
                 if is_numeric_dtype(df_comp[column]):
@@ -3267,8 +4316,16 @@ elif page == "Infraestructura AWS":
             st.subheader("Datos")
             display_data = sanitize_dataframe_for_display(data)
             display_data = ensure_monitoring_alert_columns(display_data)
+            if cache_key == "lambda":
+                display_data = ensure_lambda_usage_columns(display_data)
+            if cache_key == "iam_users":
+                display_data = ensure_iam_access_columns(display_data)
+            if cache_key == "dynamodb":
+                display_data = add_dynamodb_readable_size(display_data)
             if "region" in display_data.columns:
                 display_data["region"] = display_data["region"].map(get_region_display_label)
+            if cache_key == "lambda":
+                display_data = order_lambda_columns(display_data)
 
             if cache_key == "s3":
                 s3_preferred_columns = [
@@ -3309,6 +4366,34 @@ elif page == "Infraestructura AWS":
                     cols[0].metric("Buckets publicos", public_count)
                     cols[1].metric("Validacion pendiente", unknown_count)
                     cols[2].metric("Brechas gobernanza", gap_count)
+
+            if cache_key == "lambda":
+                usage_df = display_data.copy()
+                idle_days = pd.to_numeric(
+                    usage_df.get("dias_desde_ultima_invocacion", pd.Series(dtype="float64")),
+                    errors="coerce",
+                )
+                invocations_30d = pd.to_numeric(
+                    usage_df.get("invocaciones_30d", pd.Series(dtype="float64")),
+                    errors="coerce",
+                ).fillna(0)
+                no_invocations = usage_df["estado_uso"].astype(str).str.contains(
+                    "Sin invocaciones", case=False, na=False
+                )
+                inactive_90d = no_invocations | (idle_days >= 90)
+                active_30d = invocations_30d > 0
+                usage_cols = st.columns(3)
+                usage_cols[0].metric("Invocadas ultimos 30 dias", int(active_30d.sum()))
+                usage_cols[1].metric("Sin uso >=90 dias", int(inactive_90d.sum()))
+                usage_cols[2].metric("Sin invocaciones en ventana", int(no_invocations.sum()))
+                st.caption(
+                    "Uso Lambda estimado con metrica CloudWatch Invocations; la ventana maxima revisada es 455 dias."
+                )
+                if (usage_df["estado_uso"].astype(str) == "Pendiente de descarga").all():
+                    st.info(
+                        "El cache Lambda actual no trae datos de invocacion. "
+                        "Descarga/actualiza el cache de Lambda para poblar estas columnas."
+                    )
 
             if cache_key == "vpc_outbound_ips":
                 ip_display_df = display_data.copy()
@@ -3396,6 +4481,8 @@ elif page == "Infraestructura AWS":
                         ]
                     )
                 )
+                if cache_key == "dynamodb" and "items" in display_data.columns:
+                    styled_display_data = styled_display_data.format({"items": format_integer_thousands_es})
                 st.dataframe(styled_display_data, use_container_width=True)
 
             if selected_region == ALL_REGIONS_OPTION and "region" in display_data.columns:
@@ -3530,8 +4617,9 @@ elif page == "Productos":
         "Agrupacion sugerida de recursos basada en tags, patrones de nombre y relaciones detectadas."
     )
 
-    product_df = build_product_inventory_dataframe(selected_account, selected_region)
-    relationships_df = build_product_relationships_dataframe(selected_account, selected_region)
+    current_cache_version = get_analytics_cache_version(selected_account, selected_region)
+    product_df = build_product_inventory_dataframe(selected_account, selected_region, current_cache_version)
+    relationships_df = build_product_relationships_dataframe(selected_account, selected_region, current_cache_version)
     summary_df = build_product_summary_dataframe(product_df, relationships_df)
 
     total_products = len(summary_df)
@@ -3636,8 +4724,9 @@ elif page == "Mapa de Infra":
     st.caption(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
     st.caption("MVP de red por producto basado en recursos y relaciones detectadas desde cache.")
 
-    product_df = build_product_inventory_dataframe(selected_account, selected_region)
-    relationships_df = build_product_relationships_dataframe(selected_account, selected_region)
+    current_cache_version = get_analytics_cache_version(selected_account, selected_region)
+    product_df = build_product_inventory_dataframe(selected_account, selected_region, current_cache_version)
+    relationships_df = build_product_relationships_dataframe(selected_account, selected_region, current_cache_version)
     summary_df = build_product_summary_dataframe(product_df, relationships_df)
 
     if summary_df.empty:
@@ -3714,7 +4803,8 @@ elif page == "Tags":
     st.caption(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
     st.caption("Tags obligatorios evaluados: " + ", ".join(MANDATORY_TAGS))
 
-    tags_df = build_tag_compliance_dataframe(selected_account, selected_region)
+    current_cache_version = get_analytics_cache_version(selected_account, selected_region)
+    tags_df = build_tag_compliance_dataframe(selected_account, selected_region, current_cache_version)
     if tags_df.empty:
         st.warning("No hay recursos cacheados para analizar tags en este alcance.")
     else:
@@ -3778,7 +4868,12 @@ elif page == "Billing":
     st.title("Billing")
     st.caption(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
 
-    recommendations_df = build_billing_recommendations_dataframe(selected_account, selected_region)
+    current_cache_version = get_analytics_cache_version(selected_account, selected_region)
+    recommendations_df = build_billing_recommendations_dataframe(
+        selected_account,
+        selected_region,
+        current_cache_version,
+    )
     high_count = int((recommendations_df["Prioridad"] == "Alta").sum()) if not recommendations_df.empty else 0
     medium_count = int((recommendations_df["Prioridad"] == "Media").sum()) if not recommendations_df.empty else 0
     low_count = int((recommendations_df["Prioridad"] == "Baja").sum()) if not recommendations_df.empty else 0
@@ -3796,19 +4891,23 @@ elif page == "Billing":
     st.subheader("Cost Explorer")
     st.caption("Consulta los ultimos meses por servicio y region. Requiere permisos ce:GetCostAndUsage.")
     cost_state_key = f"cost_explorer_{selected_account}"
+    ec2_other_state_key = f"cost_explorer_ec2_other_{selected_account}"
     if st.button("Consultar Cost Explorer", use_container_width=False):
         try:
             with st.spinner("Consultando Cost Explorer..."):
                 cost_df = fetch_cost_explorer_dataframe(selected_account)
+                ec2_other_df = fetch_ec2_other_cost_breakdown_dataframe(selected_account)
             if cost_df.empty:
                 st.info("Cost Explorer no retorno costos para la cuenta seleccionada.")
             else:
                 st.session_state[cost_state_key] = cost_df
+                st.session_state[ec2_other_state_key] = ec2_other_df
                 st.success("Costos actualizados desde Cost Explorer.")
         except Exception as exc:
             st.warning(f"No se pudo consultar Cost Explorer: {exc}")
 
     cached_cost_df = st.session_state.get(cost_state_key, pd.DataFrame())
+    cached_ec2_other_df = st.session_state.get(ec2_other_state_key, pd.DataFrame())
     scoped_cost_df = filter_costs_by_selected_scope(cached_cost_df, selected_region)
     if cached_cost_df.empty:
         st.info("Consulta Cost Explorer para ver KPIs, graficos y costo por producto.")
@@ -3826,16 +4925,20 @@ elif page == "Billing":
         service_cost_df = build_cost_by_service_dataframe(scoped_cost_df)
         if not service_cost_df.empty:
             st.subheader("Costo por servicio")
-            chart_df = service_cost_df.head(20).sort_values("Costo USD", ascending=True)
+            chart_df = service_cost_df.head(11).sort_values("Costo USD", ascending=True).copy()
+            chart_df["% del Total etiqueta"] = chart_df["% del Total"].apply(lambda value: f"{value:.1f}%")
             fig = px.bar(
                 chart_df,
                 x="Costo USD",
                 y="Servicio",
                 orientation="h",
-                title="Top servicios por costo mensual",
+                title="Top 11 servicios por costo mensual",
                 color="Costo USD",
+                text="% del Total etiqueta",
             )
             fig = style_plotly_figure(fig, theme_name)
+            fig.update_traces(textposition="outside", cliponaxis=False)
+            fig.update_layout(xaxis_range=[0, chart_df["Costo USD"].max() * 1.16])
             st.plotly_chart(fig, use_container_width=True)
 
             st.dataframe(
@@ -3847,6 +4950,64 @@ elif page == "Billing":
                     "% del Total": st.column_config.NumberColumn("% del Total", format="%.1f%%"),
                 },
             )
+
+        ec2_other_component_df = build_ec2_other_component_dataframe(cached_ec2_other_df, selected_region)
+        if not ec2_other_component_df.empty:
+            st.subheader("Detalle EC2 - Other")
+            st.caption(
+                "Desglose real de Cost Explorer por Usage Type. La atribucion por EC2/producto se estima "
+                "con el inventario EBS cacheado; para precision contable se requieren tags de asignacion."
+            )
+            component_summary_df = (
+                ec2_other_component_df.groupby("Componente", as_index=False)["Costo USD"]
+                .sum()
+                .sort_values("Costo USD", ascending=False)
+            )
+            fig = px.bar(
+                component_summary_df,
+                x="Costo USD",
+                y="Componente",
+                orientation="h",
+                title="Componentes dentro de EC2 - Other",
+                color="Costo USD",
+            )
+            fig = style_plotly_figure(fig, theme_name)
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.dataframe(
+                sanitize_dataframe_for_display(ec2_other_component_df),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Costo USD": st.column_config.NumberColumn("Costo USD", format="$%.2f"),
+                    "% EC2 - Other": st.column_config.NumberColumn("% EC2 - Other", format="%.1f%%"),
+                },
+            )
+
+            ec2_other_attribution_df = build_ec2_other_inventory_attribution_dataframe(
+                selected_account,
+                selected_region,
+                cached_ec2_other_df,
+                current_cache_version,
+            )
+            if not ec2_other_attribution_df.empty:
+                st.subheader("Atribucion estimada EBS por EC2/producto")
+                ec2_other_attribution_df = render_excel_like_filters(
+                    ec2_other_attribution_df,
+                    "billing_ec2_other_attribution",
+                    ["Componente", "Producto", "EC2", "Nombre recurso", "ID recurso", "Region", "Confianza"],
+                )
+                st.dataframe(
+                    sanitize_dataframe_for_display(ec2_other_attribution_df),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Tamano GB": st.column_config.NumberColumn("Tamano GB", format="%.0f"),
+                        "Costo estimado USD": st.column_config.NumberColumn("Costo estimado", format="$%.2f"),
+                    },
+                )
+            else:
+                st.info("Para atribuir EBS a EC2/producto, actualiza el cache de EBS Volumes y EBS Snapshots.")
 
         current_cost_df = get_current_month_costs(scoped_cost_df)
         if not current_cost_df.empty:
@@ -3870,6 +5031,7 @@ elif page == "Billing":
             selected_account,
             selected_region,
             cached_cost_df,
+            current_cache_version,
         )
         if not product_cost_df.empty:
             st.subheader("Costo por producto")
@@ -3912,7 +5074,8 @@ elif page == "Vulnerabilidades":
     st.title("Vulnerabilidades")
     st.caption(f"Cuenta: {selected_account_label} | Vista: {selected_region_label}")
 
-    vulnerability_df = build_vulnerability_dataframe(selected_account, selected_region)
+    current_cache_version = get_analytics_cache_version(selected_account, selected_region)
+    vulnerability_df = build_vulnerability_dataframe(selected_account, selected_region, current_cache_version)
     high_count = int((vulnerability_df["Prioridad"] == "Alta").sum()) if not vulnerability_df.empty else 0
     medium_count = int((vulnerability_df["Prioridad"] == "Media").sum()) if not vulnerability_df.empty else 0
     by_service_count = vulnerability_df["Servicio"].nunique() if not vulnerability_df.empty else 0
@@ -3937,21 +5100,14 @@ elif page == "Vulnerabilidades":
         display_df = sanitize_dataframe_for_display(vulnerability_df)
         display_df["Region"] = display_df["Region"].map(get_region_display_label)
 
-        tab_summary, tab_backlog, tab_owner, tab_product, tab_technical, tab_export = st.tabs(
-            ["Resumen", "Backlog", "Por responsable", "Por producto", "Detalle tecnico", "Export"]
+        vulnerability_view = st.radio(
+            "Vista vulnerabilidades",
+            ["Resumen", "Por producto", "Detalle tecnico", "Export"],
+            horizontal=True,
+            label_visibility="collapsed",
         )
 
-        with tab_summary:
-            summary_col1, summary_col2, summary_col3 = st.columns(3)
-            with summary_col1:
-                st.metric("Sin responsable", no_owner_count)
-            with summary_col2:
-                p0_p1_count = int(display_df["Prioridad interna"].isin(["P0", "P1"]).sum())
-                st.metric("P0/P1", p0_p1_count)
-            with summary_col3:
-                accepted_count = int((display_df["Riesgo aceptado"] == "Si").sum())
-                st.metric("Riesgo aceptado", accepted_count)
-
+        if vulnerability_view == "Resumen":
             summary_df = vulnerability_df.groupby(["Servicio", "Prioridad"]).size().reset_index(name="Cantidad")
             fig = px.bar(
                 summary_df,
@@ -3976,50 +5132,7 @@ elif page == "Vulnerabilidades":
                 hide_index=True,
             )
 
-        with tab_backlog:
-            st.subheader("Backlog de remediacion")
-            backlog_columns = [column for column in VULNERABILITY_BACKLOG_COLUMNS if column in display_df.columns]
-            backlog_export_df = vulnerability_df[
-                [column for column in VULNERABILITY_BACKLOG_COLUMNS if column in vulnerability_df.columns]
-            ]
-            backlog_download = BytesIO()
-            backlog_export_df.to_excel(backlog_download, index=False, sheet_name="Backlog")
-            st.download_button(
-                "Descargar backlog de remediacion",
-                data=backlog_download.getvalue(),
-                file_name="backlog_remediacion.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=False,
-            )
-            st.dataframe(
-                display_df[backlog_columns],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        with tab_owner:
-            st.subheader("Hallazgos por responsable")
-            owner_counts_df = (
-                vulnerability_df.groupby("Responsable sugerido", dropna=False)
-                .size()
-                .reset_index(name="Cantidad")
-                .sort_values("Cantidad", ascending=False)
-            )
-            st.dataframe(
-                sanitize_dataframe_for_display(owner_counts_df),
-                use_container_width=True,
-                hide_index=True,
-            )
-            for owner in owner_counts_df["Responsable sugerido"].astype(str).tolist():
-                owner_label = owner or "Sin responsable"
-                owner_df = display_df[display_df["Responsable sugerido"].astype(str) == owner]
-                with st.expander(owner_label, expanded=False):
-                    owner_columns = [
-                        column for column in VULNERABILITY_BACKLOG_COLUMNS if column in owner_df.columns
-                    ]
-                    st.dataframe(owner_df[owner_columns], use_container_width=True, hide_index=True)
-
-        with tab_product:
+        if vulnerability_view == "Por producto":
             st.subheader("Vulnerabilidades por producto")
             product_summary_df = (
                 vulnerability_df.groupby(["Producto", "Responsable sugerido", "Prioridad interna"], dropna=False)
@@ -4081,29 +5194,127 @@ elif page == "Vulnerabilidades":
                     hide_index=True,
                 )
 
-        with tab_technical:
+        if vulnerability_view == "Detalle tecnico":
             st.subheader("Detalle tecnico y trazabilidad")
-            technical_columns = [
-                column for column in VULNERABILITY_TECHNICAL_COLUMNS if column in display_df.columns
+            technical_display_df = prepare_vulnerability_technical_display(display_df)
+            lambda_usage_columns = [
+                "Lambda last invoked at",
+                "Lambda invocations 30d",
+                "Lambda idle days",
+                "Lambda usage status",
             ]
+            if all(column in display_df.columns for column in lambda_usage_columns):
+                lambda_findings_df = display_df[display_df["Servicio"].astype(str) == "Lambda"]
+                if not lambda_findings_df.empty:
+                    lambda_findings_unique_df = lambda_findings_df.drop_duplicates(
+                        subset=["Cuenta", "Region", "Recurso"],
+                        keep="first",
+                    )
+                    lambda_idle_days = pd.to_numeric(lambda_findings_unique_df["Lambda idle days"], errors="coerce")
+                    lambda_invocations_30d = pd.to_numeric(
+                        lambda_findings_unique_df["Lambda invocations 30d"],
+                        errors="coerce",
+                    ).fillna(0)
+                    lambda_no_invocations = lambda_findings_unique_df["Lambda usage status"].astype(str).str.contains(
+                        "Sin invocaciones",
+                        case=False,
+                        na=False,
+                    )
+                    lambda_usage_cols = st.columns(3)
+                    lambda_usage_cols[0].metric(
+                        "Lambdas con hallazgo invocadas 30d",
+                        int((lambda_invocations_30d > 0).sum()),
+                    )
+                    lambda_usage_cols[1].metric(
+                        "Lambdas con hallazgo sin uso >=90 dias",
+                        int((lambda_no_invocations | (lambda_idle_days >= 90)).sum()),
+                    )
+                    lambda_usage_cols[2].metric(
+                        "Lambdas con hallazgo sin invocaciones",
+                        int(lambda_no_invocations.sum()),
+                    )
+                    st.caption(
+                        "Este resumen considera solo recursos Lambda unicos con hallazgos. "
+                        "Infraestructura AWS considera todas las Lambdas inventariadas."
+                    )
+                    if (
+                        lambda_findings_unique_df["Lambda usage status"].astype(str).str.strip().eq("").all()
+                    ):
+                        st.info(
+                            "Los hallazgos Lambda vienen de un cache anterior sin datos de invocacion. "
+                            "Actualiza el cache Lambda para completar la trazabilidad de uso."
+                        )
+            if "Clasificacion uso Lambda" in technical_display_df.columns:
+                available_classifications = [
+                    classification
+                    for classification in LAMBDA_USAGE_CLASSIFICATION_ORDER
+                    if classification in set(technical_display_df["Clasificacion uso Lambda"].astype(str))
+                ]
+                remaining_classifications = sorted(
+                    set(technical_display_df["Clasificacion uso Lambda"].astype(str))
+                    - set(available_classifications)
+                    - {""}
+                )
+                classification_options = available_classifications + remaining_classifications
+                if classification_options:
+                    selected_classifications = st.multiselect(
+                        "Clasificacion uso Lambda",
+                        classification_options,
+                        default=classification_options,
+                    )
+                    lambda_classification_df = technical_display_df[
+                        technical_display_df["Clasificacion uso Lambda"].astype(str).isin(classification_options)
+                    ].drop_duplicates(subset=["Cuenta", "Region", "Recurso"], keep="first")
+                    if not lambda_classification_df.empty:
+                        classification_counts = (
+                            lambda_classification_df["Clasificacion uso Lambda"]
+                            .value_counts()
+                            .reindex(classification_options, fill_value=0)
+                        )
+                        classification_cols = st.columns(min(len(classification_options), 5))
+                        for index, classification in enumerate(classification_options[:5]):
+                            classification_cols[index].metric(
+                                classification,
+                                int(classification_counts.get(classification, 0)),
+                            )
+                    technical_display_df = technical_display_df[
+                        (technical_display_df["Clasificacion uso Lambda"].astype(str).isin(selected_classifications))
+                        | (technical_display_df["Clasificacion uso Lambda"].astype(str).str.strip() == "")
+                    ]
+
+            sort_key = technical_display_df["Clasificacion uso Lambda"].map(
+                {classification: index for index, classification in enumerate(LAMBDA_USAGE_CLASSIFICATION_ORDER)}
+            )
+            technical_display_df = (
+                technical_display_df.assign(_orden_clasificacion=sort_key.fillna(99))
+                .sort_values(["_orden_clasificacion", "Cuenta", "Region", "Recurso"], kind="stable")
+                .drop(columns=["_orden_clasificacion"])
+            )
             st.dataframe(
-                display_df[technical_columns],
+                style_lambda_usage_classification(technical_display_df),
                 use_container_width=True,
                 hide_index=True,
             )
 
-        with tab_export:
+        if vulnerability_view == "Export":
             st.subheader("Export")
-            backlog_export_df = vulnerability_df[
-                [column for column in VULNERABILITY_BACKLOG_COLUMNS if column in vulnerability_df.columns]
+            vulnerability_export_df = add_lambda_usage_classification_for_export(vulnerability_df)
+            backlog_export_columns = [
+                column for column in [
+                    "Clasificacion uso Lambda",
+                    "Detalle clasificacion Lambda",
+                    *VULNERABILITY_BACKLOG_COLUMNS,
+                ]
+                if column in vulnerability_export_df.columns
             ]
+            backlog_export_df = vulnerability_export_df[backlog_export_columns]
             full_export = BytesIO()
             backlog_export = BytesIO()
             by_owner_export = BytesIO()
-            vulnerability_df.to_excel(full_export, index=False, sheet_name="Vulnerabilidades")
+            vulnerability_export_df.to_excel(full_export, index=False, sheet_name="Vulnerabilidades")
             backlog_export_df.to_excel(backlog_export, index=False, sheet_name="Backlog")
             with pd.ExcelWriter(by_owner_export, engine="openpyxl") as writer:
-                for owner, owner_df in vulnerability_df.groupby("Responsable sugerido", dropna=False):
+                for owner, owner_df in vulnerability_export_df.groupby("Responsable sugerido", dropna=False):
                     sheet_name = _safe_export_slug(owner or "sin_responsable")[:31] or "sin_responsable"
                     owner_df.to_excel(writer, index=False, sheet_name=sheet_name)
 
@@ -4132,6 +5343,209 @@ elif page == "Vulnerabilidades":
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
+
+elif page == "DRP":
+    target_account = REGIONAL_COMPARISON_TARGET["account"]
+    left_region = REGIONAL_COMPARISON_TARGET["left_region"]
+    right_region = REGIONAL_COMPARISON_TARGET["right_region"]
+    left_label = REGIONAL_COMPARISON_TARGET["left_label"]
+    right_label = REGIONAL_COMPARISON_TARGET["right_label"]
+
+    st.title("DRP")
+    st.caption(
+        "MVP de orientacion para failover Virginia -> Ohio basado en inventario cacheado, nombres y configuracion principal."
+    )
+
+    st.markdown(
+        build_resource_summary_card(
+            "Alcance DRP",
+            target_account,
+            f"{left_label} ({left_region}) hacia {right_label} ({right_region})",
+        ),
+        unsafe_allow_html=True,
+    )
+
+    drp_cache_version = get_cache_scope_version(
+        target_account,
+        ALL_REGIONS_OPTION,
+        [service_meta["key"] for service_meta in REGIONAL_COMPARISON_SERVICES],
+    )
+    drp_df = build_drp_analysis_dataframe(target_account, left_region, right_region, drp_cache_version)
+    drp_summary_df = build_drp_product_summary_dataframe(drp_df)
+
+    total_products = len(drp_summary_df)
+    ready_products = int((drp_summary_df["Estado DRP"] == "Listo aparente").sum()) if not drp_summary_df.empty else 0
+    partial_products = int((drp_summary_df["Estado DRP"] == "Parcial").sum()) if not drp_summary_df.empty else 0
+    blocked_products = int((drp_summary_df["Estado DRP"] == "Bloqueado").sum()) if not drp_summary_df.empty else 0
+    doubtful_products = int((drp_summary_df["Estado DRP"] == "Dudoso").sum()) if not drp_summary_df.empty else 0
+
+    metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
+    with metric_col1:
+        st.metric("Productos", total_products)
+    with metric_col2:
+        st.metric("Listos aparentes", ready_products)
+    with metric_col3:
+        st.metric("Parciales", partial_products)
+    with metric_col4:
+        st.metric("Bloqueados", blocked_products)
+    with metric_col5:
+        st.metric("Dudosos", doubtful_products)
+
+    if drp_df.empty:
+        st.warning("No hay evidencia suficiente para construir el analisis DRP. Descarga cache de afex-prod en Virginia y Ohio.")
+    else:
+        tab_summary, tab_product, tab_gaps, tab_evidence = st.tabs(
+            ["Resumen", "Por Producto", "Brechas", "Evidencia"]
+        )
+
+        with tab_summary:
+            st.subheader("Resumen Ejecutivo")
+            st.caption(
+                "La clasificacion no certifica continuidad operativa; prioriza donde revisar antes de una prueba DRP."
+            )
+            summary_display = sanitize_dataframe_for_display(
+                drp_summary_df.drop(columns=["Producto key"], errors="ignore")
+            )
+            st.dataframe(summary_display, use_container_width=True, hide_index=True)
+
+            status_df = (
+                drp_summary_df.groupby("Estado DRP", as_index=False)
+                .size()
+                .rename(columns={"size": "Productos"})
+            )
+            if not status_df.empty:
+                fig = px.bar(
+                    status_df,
+                    x="Estado DRP",
+                    y="Productos",
+                    color="Estado DRP",
+                    title="Productos por estado DRP",
+                    color_discrete_map=DRP_STATUS_COLORS,
+                )
+                fig = style_plotly_figure(fig, theme_name)
+                st.plotly_chart(fig, use_container_width=True)
+
+        with tab_product:
+            st.subheader("Analisis por Producto")
+            product_options = drp_summary_df["Producto key"].tolist()
+            product_labels = dict(zip(drp_summary_df["Producto key"], drp_summary_df["Producto"]))
+            selected_product_key = st.selectbox(
+                "Producto",
+                product_options,
+                format_func=lambda key: product_labels.get(key, key),
+            )
+            selected_product_rows = drp_df[drp_df["Producto key"] == selected_product_key].copy()
+            selected_summary = drp_summary_df[drp_summary_df["Producto key"] == selected_product_key].iloc[0]
+
+            prod_col1, prod_col2, prod_col3, prod_col4 = st.columns(4)
+            with prod_col1:
+                st.metric("Estado", selected_summary["Estado DRP"])
+            with prod_col2:
+                st.metric("Readiness", f"{int(selected_summary['Readiness'])}%")
+            with prod_col3:
+                st.metric("Componentes", int(selected_summary["Componentes"]))
+            with prod_col4:
+                st.metric("Bloqueantes", int(selected_summary["Bloqueados"]))
+
+            layer_rows = []
+            for service_name, service_rows in selected_product_rows.groupby("Servicio"):
+                statuses = service_rows["Estado DRP"].fillna("Sin clasificar").tolist()
+                service_status = max(statuses, key=lambda status: DRP_STATUS_RANK.get(status, 0))
+                layer_rows.append(
+                    {
+                        "Servicio": service_name,
+                        "Estado DRP": service_status,
+                        "Componentes": len(service_rows),
+                        "Bloqueados": int((service_rows["Estado DRP"] == "Bloqueado").sum()),
+                        "Parciales": int((service_rows["Estado DRP"] == "Parcial").sum()),
+                        "Dudosos": int((service_rows["Estado DRP"] == "Dudoso").sum()),
+                        "Listos aparentes": int((service_rows["Estado DRP"] == "Listo aparente").sum()),
+                    }
+                )
+            st.markdown("**Semaforo por servicio**")
+            st.dataframe(pd.DataFrame(layer_rows), use_container_width=True, hide_index=True)
+
+            detail_columns = [
+                "Servicio",
+                "Componente base",
+                "Virginia",
+                "Ohio",
+                "Ambiente Virginia",
+                "Ambiente Ohio",
+                "Estado DRP",
+                "Impacto",
+                "Observacion",
+                "Accion sugerida",
+                "Confianza",
+            ]
+            st.markdown("**Detalle del producto**")
+            st.dataframe(
+                sanitize_dataframe_for_display(selected_product_rows[detail_columns]),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with tab_gaps:
+            st.subheader("Brechas Tecnicas")
+            gap_df = drp_df[
+                drp_df["Estado DRP"].isin(["Bloqueado", "Parcial", "Dudoso"])
+            ].copy()
+            gap_df["Prioridad"] = gap_df["Estado DRP"].map(
+                {"Bloqueado": "Alta", "Parcial": "Alta", "Dudoso": "Media"}
+            )
+            gap_columns = [
+                "Prioridad",
+                "Producto",
+                "Servicio",
+                "Componente base",
+                "Estado DRP",
+                "Impacto",
+                "Observacion",
+                "Accion sugerida",
+                "Virginia",
+                "Ohio",
+            ]
+            if gap_df.empty:
+                st.success("No se detectaron brechas principales con las reglas MVP.")
+            else:
+                gap_df = gap_df.sort_values(
+                    by=["Prioridad", "Producto", "Servicio", "Estado DRP"],
+                    ascending=[True, True, True, True],
+                    kind="stable",
+                )
+                st.dataframe(
+                    sanitize_dataframe_for_display(gap_df[gap_columns]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        with tab_evidence:
+            st.subheader("Evidencia")
+            st.caption(
+                "Detalle tecnico usado por el MVP para explicar cada clasificacion."
+            )
+            evidence_columns = [
+                "Producto",
+                "Servicio",
+                "Componente base",
+                "Virginia",
+                "Ohio",
+                "Ambiente Virginia",
+                "Ambiente Ohio",
+                "Estado DRP",
+                "Config Virginia",
+                "Config Ohio",
+                "Cache Virginia",
+                "Cache Ohio",
+                "Confianza",
+                "Duplicados Virginia",
+                "Duplicados Ohio",
+            ]
+            st.dataframe(
+                sanitize_dataframe_for_display(drp_df[evidence_columns]),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 elif page == "Comparacion Regional":
     target_account = REGIONAL_COMPARISON_TARGET["account"]

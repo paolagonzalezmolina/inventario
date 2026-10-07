@@ -781,6 +781,8 @@ RESOURCE_DEFINITIONS = {
     'rds': {'label': 'RDS', 'global': False},
     'vpc': {'label': 'VPC', 'global': False},
     'vpc_outbound_ips': {'label': 'VPC Outbound IPs', 'global': False},
+    'ebs_volumes': {'label': 'EBS Volumes', 'global': False},
+    'ebs_snapshots': {'label': 'EBS Snapshots', 'global': False},
     's3': {'label': 'S3', 'global': True},
     'iam_users': {'label': 'IAM Users', 'global': True},
     'lambda': {'label': 'Lambda', 'global': False},
@@ -831,7 +833,8 @@ def _load_resource_data(account_profile, region, resource_type):
         get_ec2_df, get_rds_df, get_vpc_df, get_s3_df,
         get_iam_users_df, get_lambda_df, get_api_gateway_df,
         get_api_gateway_routes_df, get_cloudformation_df, get_ssm_df,
-        get_kms_df, get_dynamodb_df, get_sqs_df
+        get_kms_df, get_dynamodb_df, get_sqs_df,
+        get_ebs_volumes_df, get_ebs_snapshots_df
     )
 
     loaders = {
@@ -839,6 +842,8 @@ def _load_resource_data(account_profile, region, resource_type):
         'rds': lambda: get_rds_df(account_profile, region),
         'vpc': lambda: get_vpc_df(account_profile, region),
         'vpc_outbound_ips': lambda: _get_vpc_outbound_ips(account_profile, region),
+        'ebs_volumes': lambda: get_ebs_volumes_df(account_profile, region),
+        'ebs_snapshots': lambda: get_ebs_snapshots_df(account_profile, region),
         's3': lambda: get_s3_df(account_profile),
         'iam_users': lambda: get_iam_users_df(account_profile),
         'lambda': lambda: get_lambda_df(account_profile, region),

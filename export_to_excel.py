@@ -13,6 +13,13 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
+from inventory_scope import (
+    ALL_ACCOUNTS_OPTION,
+    ALL_REGIONS_OPTION,
+    DASHBOARD_SERVICE_CONFIG,
+    build_dashboard_count_rows,
+    resolve_inventory_scope,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,6 +38,7 @@ SERVICE_EXPORT_CONFIG = [
         "cache_key": "ec2",
         "sheet_name": "EC2",
         "summary_label": "EC2",
+        "dashboard_label": "EC2",
         "global_service": False,
         "preferred_columns": ["cuenta", "region", "nombre", "id", "tipo", "estado", "vpc", "ip_privada", "ip_publica"],
     },
@@ -38,6 +46,7 @@ SERVICE_EXPORT_CONFIG = [
         "cache_key": "rds",
         "sheet_name": "RDS",
         "summary_label": "RDS",
+        "dashboard_label": "RDS",
         "global_service": False,
         "preferred_columns": ["cuenta", "region", "nombre", "id", "motor", "version", "estado", "tipo", "almacenamiento_gb"],
     },
@@ -45,6 +54,7 @@ SERVICE_EXPORT_CONFIG = [
         "cache_key": "vpc",
         "sheet_name": "VPC",
         "summary_label": "VPC",
+        "dashboard_label": "VPC",
         "global_service": False,
         "preferred_columns": ["cuenta", "region", "nombre", "id", "cidr", "estado", "subnets"],
     },
@@ -52,6 +62,7 @@ SERVICE_EXPORT_CONFIG = [
         "cache_key": "vpc_outbound_ips",
         "sheet_name": "NAT_IPs",
         "summary_label": "NAT/IPs",
+        "dashboard_label": "NAT/IPs salida",
         "global_service": False,
         "preferred_columns": [
             "cuenta", "region", "type", "name", "resource_id", "allocation_id",
@@ -60,9 +71,34 @@ SERVICE_EXPORT_CONFIG = [
         ],
     },
     {
+        "cache_key": "ebs_volumes",
+        "sheet_name": "EBS_Volumes",
+        "summary_label": "EBS Volumes",
+        "dashboard_label": "EBS Volumes",
+        "global_service": False,
+        "preferred_columns": [
+            "cuenta", "region", "nombre", "id", "size_gb", "tipo", "estado",
+            "availability_zone", "attached_instance_id", "attachment_state",
+            "device", "delete_on_termination", "snapshot_id", "encrypted",
+            "createTime",
+        ],
+    },
+    {
+        "cache_key": "ebs_snapshots",
+        "sheet_name": "EBS_Snapshots",
+        "summary_label": "EBS Snapshots",
+        "dashboard_label": "EBS Snapshots",
+        "global_service": False,
+        "preferred_columns": [
+            "cuenta", "region", "nombre", "id", "volume_id", "volume_size_gb",
+            "estado", "startTime", "progress", "encrypted", "description",
+        ],
+    },
+    {
         "cache_key": "s3",
         "sheet_name": "S3",
         "summary_label": "S3",
+        "dashboard_label": "S3",
         "global_service": True,
         "preferred_columns": [
             "cuenta", "nombre", "region", "creacion", "acceso_publico",
@@ -76,6 +112,7 @@ SERVICE_EXPORT_CONFIG = [
         "cache_key": "iam_users",
         "sheet_name": "IAM_Users",
         "summary_label": "IAM Users",
+        "dashboard_label": "IAM",
         "global_service": True,
         "preferred_columns": ["cuenta", "username", "arn", "mfa_enabled", "access_keys", "creacion"],
     },
@@ -83,6 +120,7 @@ SERVICE_EXPORT_CONFIG = [
         "cache_key": "lambda",
         "sheet_name": "Lambda",
         "summary_label": "Lambda",
+        "dashboard_label": "Lambda",
         "global_service": False,
         "preferred_columns": [
             "cuenta", "region", "nombre", "handler", "runtime", "memoria_mb", "timeout_s",
@@ -94,6 +132,7 @@ SERVICE_EXPORT_CONFIG = [
         "cache_key": "api_gateway",
         "sheet_name": "API_Gateway",
         "summary_label": "API Gateway",
+        "dashboard_label": "API GW",
         "global_service": False,
         "preferred_columns": [
             "cuenta", "region", "nombre", "tipo", "estado", "rutas",
@@ -104,6 +143,7 @@ SERVICE_EXPORT_CONFIG = [
         "cache_key": "api_gateway_routes",
         "sheet_name": "API_Lambda_Map",
         "summary_label": "API Gateway Routes",
+        "include_in_dashboard_total": False,
         "global_service": False,
         "preferred_columns": [
             "cuenta", "region", "api_nombre", "api_id", "api_tipo", "route_key",
@@ -116,6 +156,7 @@ SERVICE_EXPORT_CONFIG = [
         "cache_key": "cloudformation",
         "sheet_name": "CloudFormation",
         "summary_label": "CloudFormation",
+        "dashboard_label": "CloudFormation",
         "global_service": False,
         "preferred_columns": ["cuenta", "region", "nombre", "estado"],
     },
@@ -123,6 +164,7 @@ SERVICE_EXPORT_CONFIG = [
         "cache_key": "ssm",
         "sheet_name": "SSM",
         "summary_label": "SSM",
+        "dashboard_label": "SSM",
         "global_service": False,
         "preferred_columns": ["cuenta", "region", "nombre", "tipo", "tier", "version", "data_type"],
     },
@@ -130,6 +172,7 @@ SERVICE_EXPORT_CONFIG = [
         "cache_key": "kms",
         "sheet_name": "KMS",
         "summary_label": "KMS",
+        "dashboard_label": "KMS",
         "global_service": False,
         "preferred_columns": ["cuenta", "region", "alias", "key_id", "arn", "estado", "manager", "origen"],
     },
@@ -137,6 +180,7 @@ SERVICE_EXPORT_CONFIG = [
         "cache_key": "dynamodb",
         "sheet_name": "DynamoDB",
         "summary_label": "DynamoDB",
+        "dashboard_label": "DynamoDB",
         "global_service": False,
         "preferred_columns": ["cuenta", "region", "nombre", "estado", "billing_mode", "lectura", "escritura"],
     },
@@ -144,6 +188,7 @@ SERVICE_EXPORT_CONFIG = [
         "cache_key": "sqs",
         "sheet_name": "SQS",
         "summary_label": "SQS",
+        "dashboard_label": "SQS",
         "global_service": False,
         "preferred_columns": ["cuenta", "region", "nombre", "fifo", "kms_key_id"],
     },
@@ -214,33 +259,21 @@ def _apply_styles(ws, df):
         ws.column_dimensions[get_column_letter(col_num)].width = min(max_length + 2, 50)
 
 
-def _get_account_regions(perfiles, account):
-    """Obtiene las regiones configuradas para una cuenta."""
-    return perfiles.get(account, {}).get("regiones", []) or ["us-east-1"]
-
-
-def _get_global_region(perfiles, account):
-    """Obtiene la region base para servicios globales."""
-    account_config = perfiles.get(account, {})
-    return account_config.get("region") or _get_account_regions(perfiles, account)[0]
-
-
 def _reorder_dataframe_columns(df, preferred_columns):
     """Reordena columnas dejando primero las mas utiles."""
     existing_cols = [column for column in preferred_columns if column in df.columns]
     return df[existing_cols + [column for column in df.columns if column not in existing_cols]]
 
 
-def _aggregate_service(cache_manager, accounts, perfiles, service_config):
+def _aggregate_service(cache_manager, scope, service_config):
     """Consolida un servicio para una o multiples cuentas."""
     dfs = []
+    cache_key = service_config["cache_key"]
 
-    for account in accounts:
-        regions = [_get_global_region(perfiles, account)] if service_config["global_service"] else _get_account_regions(perfiles, account)
-
-        for region in regions:
+    for account in scope["accounts"]:
+        for region in scope["service_regions"][account][cache_key]:
             try:
-                data, _, exists = cache_manager.get(account, region, service_config["cache_key"])
+                data, _, exists = cache_manager.get(account, region, cache_key)
             except Exception:
                 continue
 
@@ -261,7 +294,44 @@ def _aggregate_service(cache_manager, accounts, perfiles, service_config):
     return _reorder_dataframe_columns(merged_df, service_config["preferred_columns"])
 
 
-def export_to_excel(cache_manager, accounts, perfiles, output_path="inventario_aws.xlsx"):
+def _cache_getter(cache_manager):
+    def getter(account, region, cache_key):
+        try:
+            return cache_manager.get(account, region, cache_key)
+        except Exception:
+            return pd.DataFrame(), False, False
+
+    return getter
+
+
+def _build_validation_dataframe(dashboard_count_rows, export_data):
+    rows = []
+    for row in dashboard_count_rows:
+        cache_key = row["cache_key"]
+        excel_count = len(export_data.get(cache_key, pd.DataFrame()))
+        dashboard_count = row["Conteo Dashboard"]
+        difference = excel_count - dashboard_count
+        rows.append(
+            {
+                "Servicio": row["Servicio"],
+                "Conteo Dashboard": dashboard_count,
+                "Conteo Excel": excel_count,
+                "Diferencia": difference,
+                "Estado": "OK" if difference == 0 else "Revisar",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def export_to_excel(
+    cache_manager,
+    accounts,
+    perfiles,
+    output_path="inventario_aws.xlsx",
+    discovery=None,
+    selected_region=ALL_REGIONS_OPTION,
+    vulnerability_df=None,
+):
     """
     Exporta el inventario cacheado a un archivo Excel.
 
@@ -270,6 +340,7 @@ def export_to_excel(cache_manager, accounts, perfiles, output_path="inventario_a
         accounts: Lista de cuentas a incluir
         perfiles: Configuracion de perfiles/regiones
         output_path: Ruta de salida del workbook
+        vulnerability_df: DataFrame opcional con hallazgos para agregar al workbook
 
     Returns:
         Ruta generada o None si ocurre un error
@@ -279,14 +350,35 @@ def export_to_excel(cache_manager, accounts, perfiles, output_path="inventario_a
 
         export_data = {}
         summary_rows = []
+        scope_account = accounts[0] if len(accounts) == 1 else ALL_ACCOUNTS_OPTION
+        dashboard_scope = resolve_inventory_scope(
+            perfiles,
+            discovery,
+            scope_account,
+            selected_region,
+            DASHBOARD_SERVICE_CONFIG,
+        )
+        export_scope = resolve_inventory_scope(
+            perfiles,
+            discovery,
+            scope_account,
+            selected_region,
+            SERVICE_EXPORT_CONFIG,
+        )
+        dashboard_count_rows = build_dashboard_count_rows(_cache_getter(cache_manager), dashboard_scope)
 
         for service_config in SERVICE_EXPORT_CONFIG:
-            service_df = _remove_timezones(_aggregate_service(cache_manager, accounts, perfiles, service_config))
+            service_df = _remove_timezones(_aggregate_service(cache_manager, export_scope, service_config))
             export_data[service_config["cache_key"]] = service_df
+
+        validation_df = _build_validation_dataframe(dashboard_count_rows, export_data)
+        for service_config in SERVICE_EXPORT_CONFIG:
+            if service_config.get("include_in_dashboard_total", True) is False:
+                continue
             summary_rows.append(
                 {
-                    "Servicio": service_config["summary_label"],
-                    "Cantidad": len(service_df),
+                    "Servicio": service_config.get("dashboard_label", service_config["summary_label"]),
+                    "Cantidad": len(export_data[service_config["cache_key"]]),
                 }
             )
 
@@ -305,7 +397,14 @@ def export_to_excel(cache_manager, accounts, perfiles, output_path="inventario_a
         ws_summary["A4"] = "Cuenta(s)"
         ws_summary["B4"] = ", ".join(accounts)
         ws_summary["A5"] = "Regiones"
-        ws_summary["B5"] = "Todas las configuradas para cada cuenta"
+        if selected_region == ALL_REGIONS_OPTION:
+            regions_text = "; ".join(
+                f"{account}: {', '.join(export_scope['account_regions'].get(account, []))}"
+                for account in export_scope["accounts"]
+            )
+        else:
+            regions_text = selected_region
+        ws_summary["B5"] = regions_text or "Sin regiones"
 
         summary_df = pd.DataFrame(summary_rows)
         for r_idx, row in enumerate(dataframe_to_rows(summary_df, index=False, header=True), 7):
@@ -338,7 +437,23 @@ def export_to_excel(cache_manager, accounts, perfiles, output_path="inventario_a
         for column in ("A", "B", "C"):
             ws_summary.column_dimensions[column].width = 28
 
-        sheet_index = 1
+        ws_validation = wb.create_sheet("Validacion_Conteos", 1)
+        for r_idx, row in enumerate(dataframe_to_rows(validation_df, index=False, header=True), 1):
+            for c_idx, value in enumerate(row, 1):
+                ws_validation.cell(row=r_idx, column=c_idx, value=value)
+        _apply_styles(ws_validation, validation_df)
+
+        sheet_index = 2
+        if vulnerability_df is not None:
+            vulnerability_export_df = _remove_timezones(vulnerability_df.copy())
+            ws_vulnerabilities = wb.create_sheet("Vulnerabilidades", sheet_index)
+            for r_idx, row in enumerate(dataframe_to_rows(vulnerability_export_df, index=False, header=True), 1):
+                for c_idx, value in enumerate(row, 1):
+                    ws_vulnerabilities.cell(row=r_idx, column=c_idx, value=value)
+            _apply_styles(ws_vulnerabilities, vulnerability_export_df)
+            logger.info("Pestana Vulnerabilidades: %s filas", len(vulnerability_export_df))
+            sheet_index += 1
+
         for service_config in SERVICE_EXPORT_CONFIG:
             service_df = export_data[service_config["cache_key"]]
             if service_df.empty:
